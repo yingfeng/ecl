@@ -1,0 +1,18 @@
+# llmwiki 服务配置文件
+# 优先级: 环境变量 > 此文件 > 代码默认值
+server:
+  host: "0.0.0.0"
+  port: "8080"
+
+mysql:
+  host: "127.0.0.1"
+  port: 3306
+  user: "rag_flow"
+  password: "infini_rag_flow"
+  database: "llmwiki"
+
+minio:
+  host: "127.0.0.1:9000"
+  user: "rag_flow"
+  password: "infini_rag_flow"
+  secure: false
