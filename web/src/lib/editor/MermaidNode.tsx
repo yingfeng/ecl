@@ -1,6 +1,6 @@
 /**
  * MermaidNode - A Lexical DecoratorNode for rendering Mermaid diagrams.
- * Ported from Nimbalyst.
+ * Ported from Nimbalyst — supports click-to-edit source code.
  */
 
 import type { JSX } from 'react';
@@ -104,7 +104,7 @@ export class MermaidNode extends DecoratorNode<JSX.Element> {
   }
 
   decorate(_editor: LexicalEditor, config: EditorConfig): JSX.Element {
-    return <MermaidComponent content={this.__content} nodeKey={this.__key} />;
+    return <MermaidComponent content={this.__content} nodeKey={this.__key} editor={_editor} />;
   }
 }
 
@@ -128,16 +128,27 @@ export function $isMermaidNode(node: LexicalNode | null | undefined): node is Me
 
 // ─── React rendering component ─────────────────────────────
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import mermaid from 'mermaid';
+import {  $getNodeByKey } from 'lexical';
+import { useTheme } from '../theme/ThemeContext';
 
-// Initialize mermaid once at module level
 let mermaidInitialized = false;
-function ensureMermaidInit() {
+function ensureMermaidInit(themeName: string) {
+  const mermaidTheme = themeName === 'dark' ? 'dark' : 'default';
   if (!mermaidInitialized) {
     mermaid.initialize({
       startOnLoad: false,
-      theme: 'dark',
+      theme: mermaidTheme,
+      securityLevel: 'antiscript',
+      fontFamily: 'monospace',
+    });
+    mermaidInitialized = true;
+  } else {
+    mermaidInitialized = false;
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: mermaidTheme,
       securityLevel: 'antiscript',
       fontFamily: 'monospace',
     });
@@ -152,53 +163,161 @@ function queueRender(fn: () => Promise<void>): void {
     setTimeout(async () => {
       await fn();
       resolve();
-    }, 30); // 30ms gap between renders
+    }, 30);
   }));
 }
 
-function MermaidComponent({ content, nodeKey }: { content: string; nodeKey: NodeKey }) {
+interface MermaidComponentProps {
+  content: string;
+  nodeKey: NodeKey;
+  editor: LexicalEditor;
+}
+
+function MermaidComponent({ content, nodeKey, editor }: MermaidComponentProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [state, setState] = useState<'loading' | 'error' | 'done'>('loading');
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState(content);
+  const { theme } = useTheme();
+
+  // ── Render/re-render diagram ──
+  const doRender = useCallback(async (source: string) => {
+    if (!containerRef.current) return;
+    try {
+      const id = `mermaid_${nodeKey}_${Date.now()}`;
+      const { svg } = await mermaid.render(id, source);
+      if (containerRef.current) {
+        containerRef.current.innerHTML = svg;
+        setState('done');
+        setError(null);
+      }
+    } catch (err: any) {
+      setState('error');
+      setError(err?.message || String(err));
+    }
+  }, [nodeKey]);
 
   useEffect(() => {
     let mounted = true;
-    ensureMermaidInit();
+    ensureMermaidInit(theme);
 
     queueRender(async () => {
       if (!mounted) return;
       if (!containerRef.current) return;
-
-      try {
-        const id = `mermaid_${nodeKey}`;
-        const { svg } = await mermaid.render(id, content);
-        if (!mounted || !containerRef.current) return;
-        containerRef.current.innerHTML = svg;
-        setState('done');
-        setError(null);
-      } catch (err: any) {
-        if (mounted) {
-          setState('error');
-          setError(err?.message || String(err));
-        }
-      }
+      await doRender(content);
     });
 
     return () => { mounted = false; };
-  }, [content, nodeKey]);
+  }, [content, nodeKey, theme, doRender, editing]);
 
-  if (state === 'error') {
+  // ── Click to edit ──
+  const handleDiagramClick = () => {
+    setEditContent(content);
+    setEditing(true);
+  };
+
+  // ── Commit changes back to Lexical node ──
+  const commitChanges = useCallback(() => {
+    const newContent = editContent.trim();
+    if (newContent && newContent !== content) {
+      editor.update(() => {
+        const node = $getNodeByKey(nodeKey);
+        if ($isMermaidNode(node)) {
+          node.setContent(newContent);
+        }
+      });
+    }
+    setEditing(false);
+  }, [editContent, content, editor, nodeKey]);
+
+  // ── Live preview while editing (debounced) ──
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const handleEditChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setEditContent(val);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(async () => {
+      if (val.trim()) {
+        ensureMermaidInit(theme);
+        await doRender(val);
+      }
+    }, 350);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      commitChanges();
+    }
+    if (e.key === 'Escape') {
+      setEditing(false);
+      setEditContent(content);
+    }
+  };
+
+  // Error state
+  if (state === 'error' && !editing) {
     return (
-      <div className="mermaid-block" style={{ margin: '12px 0', padding: 16, border: '1px solid var(--nim-error)', borderRadius: 8, background: 'color-mix(in srgb, var(--nim-error) 8%, transparent)' }}>
+      <div className="mermaid-block" style={{ margin: '12px 0', padding: 16, border: '1px solid var(--nim-error)', borderRadius: 8, background: 'color-mix(in srgb, var(--nim-error) 8%, transparent)', cursor: 'pointer' }} onClick={handleDiagramClick}>
         <pre style={{ margin: 0, fontSize: 12, color: 'var(--nim-error)', whiteSpace: 'pre-wrap' }}>{content}</pre>
-        <div style={{ fontSize: 11, color: 'var(--nim-text-faint)', marginTop: 8 }}>Mermaid error: {error}</div>
+        <div style={{ fontSize: 11, color: 'var(--nim-text-faint)', marginTop: 8 }}>{error} — click to edit source</div>
       </div>
     );
   }
 
+  // Edit mode
+  if (editing) {
+    return (
+      <div className="mermaid-block" style={{ margin: '12px 0' }}>
+        <div ref={containerRef} className="mermaid-render-container"
+          style={{ overflowX: 'auto', minHeight: 60, marginBottom: 8, border: '1px solid var(--nim-border)', borderRadius: 6, padding: 8, background: 'var(--nim-bg)' }} />
+        <textarea
+          ref={textareaRef}
+          value={editContent}
+          onChange={handleEditChange}
+          onKeyDown={handleKeyDown}
+          onBlur={commitChanges}
+          autoFocus
+          style={{
+            width: '100%',
+            minHeight: 80,
+            padding: '8px 10px',
+            fontSize: 13,
+            fontFamily: 'Menlo, Consolas, monospace',
+            lineHeight: 1.5,
+            border: '1px solid var(--nim-border-focus)',
+            borderRadius: 6,
+            background: 'var(--nim-code-bg)',
+            color: 'var(--nim-code-text)',
+            resize: 'vertical',
+            outline: 'none',
+            boxSizing: 'border-box',
+          }}
+          placeholder="Edit mermaid source..."
+        />
+        <div style={{ fontSize: 11, color: 'var(--nim-text-faint)', marginTop: 4, display: 'flex', gap: 12 }}>
+          <span>Ctrl+Enter to apply</span>
+          <span>Esc to cancel</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Normal display mode with border + edit button above
   return (
-    <div className="mermaid-block" style={{ margin: '12px 0', textAlign: 'center' }}>
-      <div ref={containerRef} className="mermaid-render-container" style={{ overflowX: 'auto', minHeight: state === 'loading' ? 60 : 'auto' }} />
+    <div className="mermaid-block" style={{ margin: '16px 0', border: '1px solid var(--nim-border)', borderRadius: 8, overflow: 'hidden' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '4px 10px', background: 'var(--nim-bg-tertiary)', borderBottom: '1px solid var(--nim-border)', fontSize: 12 }}>
+        <span style={{ color: 'var(--nim-text-muted)', fontWeight: 600 }}>mermaid</span>
+        <button
+          onClick={(e) => { e.stopPropagation(); setEditContent(content); setEditing(true); }}
+          style={{ padding: '2px 8px', border: '1px solid var(--nim-border)', borderRadius: 4, background: 'var(--nim-bg)', color: 'var(--nim-text-muted)', cursor: 'pointer', fontSize: 11, fontFamily: 'inherit' }}>
+          Edit
+        </button>
+      </div>
+      <div style={{ textAlign: 'center', cursor: 'pointer', padding: 8 }} onClick={handleDiagramClick} title="Click to edit source">
+        <div ref={containerRef} className="mermaid-render-container" style={{ overflowX: 'auto', minHeight: state === 'loading' ? 60 : 'auto' }} />
+      </div>
     </div>
   );
 }

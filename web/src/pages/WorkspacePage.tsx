@@ -3,10 +3,12 @@ import { useParams, useNavigate } from 'react-router-dom'
 import type { TreeNode, FileCommit, Dataset } from '../types'
 import * as api from '../api'
 import MarkdownEditor from '../components/MarkdownEditor'
+import { useTheme } from '../lib/theme/ThemeContext'
 
 export default function WorkspacePage() {
   const { name } = useParams()
   const navigate = useNavigate()
+  const { theme, toggleTheme } = useTheme()
   const [dataset, setDataset] = useState<Dataset | null>(null)
   const [rootTree, setRootTree] = useState<TreeNode | null>(null)
   const [curFolder, setCurFolder] = useState<TreeNode | null>(null)
@@ -216,6 +218,10 @@ export default function WorkspacePage() {
         <div className="sidebar-hdr">
           <span className="logo">llmwiki</span>
           <span className="badge">EDIT</span>
+          <div style={{ flex: 1 }} />
+          <button className="btn-icon-sm" onClick={toggleTheme} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} style={{ fontSize: 16 }}>
+            {theme === 'dark' ? '☀️' : '🌙'}
+          </button>
         </div>
 
         <div className="section-hdr" style={{padding:'6px 20px'}}>

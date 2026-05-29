@@ -1,9 +1,6 @@
 /**
- * MarkdownEditor — mode-switching wrapper.
- *
- * Supports two modes:
- * - "wysiwyg": Lexical-based WYSIWYG editing (default)
- * - "raw": Monaco-based raw markdown editing
+ * MarkdownEditor — supports WYSIWYG (Lexical) and Raw (Monaco) modes.
+ * Mode switching is triggered by the editor toolbar's "Toggle Source" button.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react'
@@ -17,19 +14,17 @@ interface Props {
   fileName?: string
 }
 
-type EditorMode = 'wysiwyg' | 'raw'
-
 export default function MarkdownEditor({ content, onChange, readOnly, fileName }: Props) {
-  const [mode, setMode] = useState<EditorMode>('wysiwyg')
+  const [showSource, setShowSource] = useState(false)
   const [rawContent, setRawContent] = useState(content)
   const contentRef = useRef(content)
 
   useEffect(() => {
     contentRef.current = content
-    if (mode === 'raw') {
+    if (showSource) {
       setRawContent(content)
     }
-  }, [mode, content])
+  }, [showSource, content])
 
   const handleWysiwygChange = useCallback((md: string) => {
     contentRef.current = md
@@ -42,52 +37,31 @@ export default function MarkdownEditor({ content, onChange, readOnly, fileName }
     onChange(value)
   }, [onChange])
 
-  function switchMode(m: EditorMode) {
-    if (m === 'raw') {
+  const toggleSource = useCallback(() => {
+    if (!showSource) {
       setRawContent(contentRef.current)
     }
-    setMode(m)
-  }
+    setShowSource(prev => !prev)
+  }, [showSource])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      {!readOnly && (
-        <div className="nim-mode-bar">
-          <span style={{ fontSize: 11, color: 'var(--nim-text-faint)', marginRight: 8, letterSpacing: 0.5 }}>
-            MODE
-          </span>
-          <button
-            className={`nim-mode-btn ${mode === 'wysiwyg' ? 'active' : ''}`}
-            onClick={() => switchMode('wysiwyg')}
-          >
-            ✏ WYSIWYG
-          </button>
-          <button
-            className={`nim-mode-btn ${mode === 'raw' ? 'active' : ''}`}
-            onClick={() => switchMode('raw')}
-          >
-            # Raw
-          </button>
-          <div style={{ flex: 1 }} />
-          {fileName && (
-            <span style={{ fontSize: 11, color: 'var(--nim-text-faint)' }}>{fileName}</span>
-          )}
-        </div>
-      )}
-
       <div className="nim-editor-container">
-        {mode === 'wysiwyg' ? (
+        {showSource ? (
+          <RawMarkdownEditor
+            content={rawContent}
+            onChange={handleRawChange}
+            readOnly={readOnly}
+            onToggleSource={toggleSource}
+          />
+        ) : (
           <LexicalEditor
             content={content}
             onChange={handleWysiwygChange}
             readOnly={readOnly}
             placeholder={readOnly ? '' : 'Start writing...'}
-          />
-        ) : (
-          <RawMarkdownEditor
-            content={rawContent}
-            onChange={handleRawChange}
-            readOnly={readOnly}
+            onToggleSource={toggleSource}
+            showSource={showSource}
           />
         )}
       </div>

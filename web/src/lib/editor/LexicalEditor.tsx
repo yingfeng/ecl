@@ -38,6 +38,8 @@ interface Props {
   onChange?: (markdown: string) => void;
   readOnly?: boolean;
   placeholder?: string;
+  onToggleSource?: () => void;
+  showSource?: boolean;
 }
 
 function InitialContentPlugin({ content, transformers }: { content: string; transformers: Transformer[] }) {
@@ -85,7 +87,10 @@ function ChangeListener({ onChange, transformers }: { onChange?: (md: string) =>
   return null;
 }
 
-export default function LexicalEditor({ content, onChange, readOnly = false, placeholder = 'Start writing...' }: Props): JSX.Element {
+import ToolbarPlugin from './plugins/ToolbarPlugin';
+import FloatingSelectionToolbar from './plugins/FloatingSelectionToolbar';
+
+export default function LexicalEditor({ content, onChange, readOnly = false, placeholder = 'Start writing...', onToggleSource, showSource = false }: Props): JSX.Element {
   const transformers = useMemo(() => CORE_TRANSFORMERS, []);
 
   const initialConfig = useMemo(() => ({
@@ -101,8 +106,10 @@ export default function LexicalEditor({ content, onChange, readOnly = false, pla
       <div className="editor-shell">
         <LexicalComposer initialConfig={initialConfig}>
           <div className="editor-container">
+            {!readOnly && <ToolbarPlugin onToggleSource={onToggleSource || (() => {})} showSource={showSource} />}
             <InitialContentPlugin content={content} transformers={transformers} />
             <ChangeListener onChange={onChange} transformers={transformers} />
+            <FloatingSelectionToolbar />
             <RichTextPlugin
               contentEditable={
                 <div className="nim-editor-scroller">
