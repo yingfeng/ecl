@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import type { TreeNode } from '../types'
 import * as api from '../api'
-import { renderMarkdown } from '../lib/markdown'
+import MarkdownEditor from '../components/MarkdownEditor'
 
 export default function CommitPage() {
   const { name, commitId } = useParams()
@@ -44,9 +44,11 @@ export default function CommitPage() {
 
   async function selectFile(file: TreeNode) {
     if (!commitId) return
-    setSelFile(file)
-    try { setContent(await api.getCommitFileContent(commitId, file.id)) }
-    catch { setContent('') }
+    try {
+      const text = await api.getCommitFileContent(commitId, file.id)
+      setContent(text)
+      setSelFile(file)
+    } catch { setContent(''); setSelFile(file) }
   }
 
   const files = curNode?.children?.filter(c => c.type === 'file') || []
@@ -102,7 +104,7 @@ export default function CommitPage() {
       <main className="main">
         {error && <div className="error-bar">{error}</div>}
         {selFile ? (
-          <div className="editor-view">
+          <div className="editor-view" style={{display:'flex',flexDirection:'column',height:'100%'}}>
             <div className="editor-toolbar">
               <div className="editor-toolbar-left">
                 <span><strong>{selFile.name}</strong></span>
@@ -110,17 +112,12 @@ export default function CommitPage() {
               </div>
               <Link to="/" className="btn">Back to Home</Link>
             </div>
-            <div className="editor-body" style={{flex:1,display:'flex',overflow:'hidden'}}>
-              <div className="editor-pane edit-pane">
-                <div className="pane-label"><strong>{selFile.name}</strong> · Read-only</div>
-                <textarea className="editor-textarea" value={content} readOnly placeholder="File content at this version..." />
-              </div>
-              <div className="editor-pane preview-pane">
-                <div className="pane-label">Preview</div>
-                <div className="preview-scroll">
-                  <div className="preview-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />
-                </div>
-              </div>
+            <div style={{flex:1,overflow:'hidden'}}>
+              <MarkdownEditor
+                content={content}
+                onChange={() => {}}
+                readOnly
+              />
             </div>
           </div>
         ) : (

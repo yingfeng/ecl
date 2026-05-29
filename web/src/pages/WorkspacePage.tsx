@@ -72,11 +72,11 @@ export default function WorkspacePage() {
   }
 
   async function selectFile(f: TreeNode) {
-    setSelFile(f)
     try {
       const text = await api.getFileContent(f.id)
       setContent(text); setOrigContent(text); setDirty(false)
-    } catch { setContent(''); setOrigContent('') }
+      setSelFile(f)
+    } catch { setContent(''); setOrigContent(''); setSelFile(f) }
   }
 
   function viewCommit(c: FileCommit) {
@@ -365,6 +365,7 @@ export default function WorkspacePage() {
               </div>
             </div>
             <MarkdownEditor
+              key={selFile.id}
               content={content}
               onChange={text => { setContent(text); setDirty(text !== origContent) }}
               fileName={selFile?.name}
