@@ -112,14 +112,12 @@ export default function CommitPage() {
               </div>
               <Link to="/" className="btn">Back to Home</Link>
             </div>
-            <div style={{flex:1,overflow:'hidden'}}>
-              <MarkdownEditor
-                key={selFile.id}
-                content={content}
-                onChange={() => {}}
-                readOnly
-              />
-            </div>
+            <MarkdownEditor
+              key={selFile.id}
+              content={content}
+              onChange={() => {}}
+              readOnly
+            />
           </div>
         ) : (
           <div className="welcome">
