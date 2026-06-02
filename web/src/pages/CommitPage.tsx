@@ -3,6 +3,7 @@ import { useParams, Link } from 'react-router-dom'
 import type { TreeNode } from '../types'
 import * as api from '../api'
 import MarkdownEditor from '../components/MarkdownEditor'
+import { downloadCommitFile, downloadAllCommitFiles } from '../lib/export-obsidian'
 
 export default function CommitPage() {
   const { name, commitId } = useParams()
@@ -110,7 +111,13 @@ export default function CommitPage() {
                 <span><strong>{selFile.name}</strong></span>
                 <span className="badge badge-commit" style={{marginLeft:8}}>Read-only</span>
               </div>
-              <Link to="/" className="btn">Back to Home</Link>
+              <div className="toolbar-actions">
+                <button className="btn" onClick={() => downloadCommitFile(commitId!, selFile.id, selFile.name)}
+                  title="Download this file">⬇ Download</button>
+                <button className="btn-primary" onClick={() => downloadAllCommitFiles(commitId!, name || 'workspace')}
+                  title="Download all files as ZIP">⬇ Export All</button>
+                <Link to="/" className="btn">Back to Home</Link>
+              </div>
             </div>
             <MarkdownEditor
               key={selFile.id}
