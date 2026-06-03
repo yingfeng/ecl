@@ -149,6 +149,43 @@ func (l *LLMClient) ChatStream(ctx context.Context, systemPrompt, userPrompt str
 	return nil
 }
 
+// ChatRaw sends a chat request and returns the raw response content string.
+func (l *LLMClient) ChatRaw(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	l.logf("[LLM] ChatRaw — system(%d chars), user(%d chars)\n", len(systemPrompt), len(userPrompt))
+
+	messages := []openai.ChatCompletionMessage{
+		{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+		{Role: openai.ChatMessageRoleUser, Content: userPrompt},
+	}
+
+	req := openai.ChatCompletionRequest{
+		Model:       l.model,
+		Messages:    messages,
+		Temperature: 0.3,
+		MaxTokens:   16384,
+	}
+
+	start := time.Now()
+	resp, err := l.client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		l.logf("[LLM] Error: %v\n", err)
+		return "", fmt.Errorf("chat completion: %w", err)
+	}
+
+	elapsed := time.Since(start)
+	if len(resp.Choices) == 0 {
+		l.logf("[LLM] No choices\n")
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	content := resp.Choices[0].Message.Content
+	l.logf("[LLM] Response received in %v (%d chars)\n", elapsed, len(content))
+	l.logf("[LLM] Usage: %d prompt + %d completion tokens\n",
+		resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+
+	return content, nil
+}
+
 func truncate(s string, max int) string {
 	if len(s) <= max {
 		return s

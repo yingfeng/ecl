@@ -1,150 +1,85 @@
 ---
 name: wiki-compiler
-description: API-based knowledge compilation agent. Reads workspace files via the llmwiki API, compiles them into topic-based wiki articles, and outputs via the same API. Triggered by the agent compile pipeline.
+description: 多阶段知识编译算法。先扫描源文件发现主题，再逐个编译主题文章，最后生成索引。
 ---
 
-# Wiki Compiler — Compilation Algorithm
+# Wiki Compiler
 
-This skill defines the algorithm for compiling source markdown files into a topic-based wiki knowledge base.
+你是一个知识编译专家。你收到的源文件内容在 `## 源文件` 章节中。
 
-## Architecture
+## 第一阶段：扫描并发现主题
 
-This agent runs inside the llmwiki backend. It accesses files through the backend service layer (not file system). The pipeline:
+分析每个源文件的：
+- 路径和文件名（目录结构是强信号）
+- 标题（首个 `#` 内容）
+- 前 500 字内容主题
 
-1. **Read source files** from the workspace via the file tree + content API
-2. **Process** through LLM with this skill as instruction context
-3. **Output** compiled articles as JSON via the pipeline
-4. **Write** files to the workspace via API (`CreateTextFile`, `CreateFolder`)
-5. **Commit** the version snapshot via API (`CreateCommit`)
+输出你发现的**主题列表**，每个主题包含：
+- 主题名（kebab-case，如 `deep-learning`）
+- 关联的源文件路径列表
+- 简短描述（一句话）
 
-## Phase 1: Understand Source Files
+## 第二阶段：编译主题文章
 
-The source files are provided in the prompt as a list with their full content. Each file has:
-- `path`: relative path within the workspace (e.g., `docs/architecture.md`)
-- `name`: file name (e.g., `architecture.md`)
-- `content`: full markdown content of the file
+为第一阶段的**每个主题**生成一篇知识文章。文章必须满足：
 
-### Rules
-- All source files are read-only. Do not modify source content.
-- Source files are markdown (.md) format.
-- Filter out non-essential files (node_modules, binaries, etc.) — focus on documentation and knowledge content.
-
-## Phase 2: Classify and Discover Topics
-
-For each source file, analyze:
-1. File path (directory structure is a strong signal)
-2. Title (first `#` heading)
-3. Content themes and key terms
-4. Other files referencing the same concepts
-
-### Topic Discovery
-- Group related files into topics based on shared themes and directory structure.
-- Topic slugs should be lowercase-kebab-case (e.g., `architecture-design`, `deployment-guide`).
-- A single file can belong to MULTIPLE topics if it covers multiple subjects.
-- If 3+ unclassified files share a theme, create a new topic.
-- Prefer consolidating related content rather than creating too many topics.
-
-### Topic Classification
-Classify each topic as:
-- **Time-sensitive** (default): topics about fast-moving domains — AI tools, UI patterns, workflows, external services. Claims older than 6 months are "aging", older than 18 months are "stale".
-- **Stable**: foundational concepts, architecture decisions, personal knowledge. Claims older than 24 months are "aging", older than 48 months are "stale".
-
-## Phase 3: Compile Topic Articles
-
-For each topic, compile a comprehensive article. Write to the output directory.
-
-### Article Structure
-
+### 结构要求
 ```markdown
-# {Topic Title}
+# {Title}
 
-## Summary
-Standalone briefing of the topic. Someone reading just this section should understand the current state. Include the date range of source materials.
+## 概要
+{主题的独立简报。最关键的发现、结论、当前状态}
 
-## Content
-Detailed synthesis organized by subtopics. Each section must include:
-- **Coverage tag**: `[coverage: high/medium/low]` indicating how many sources contributed
-  - `high`: 5+ sources, detailed synthesis
-  - `medium`: 2-4 sources, may miss detail
-  - `low`: 0-1 sources, reader should check raw sources
-- **Date annotations**: For time-sensitive topics, prefix key claims with `[YYYY-MM]` or mark stale content with `⚠️ [YYYY-MM, may be stale]`
+## 内容
+{按子主题组织的详细内容。必须合成多个源文件的信息，不要只拷贝一个源}
+{每个小节标记覆盖度: [coverage: high/medium/low]}
+{时间敏感的内容标记 [YYYY-MM] 前缀}
 
-## Sources
-List all source files organized by their paths. Use markdown link format.
+## 资料来源
+{列出所有引用的源文件}
 ```
 
-### Coverage Rules
-- Each section heading must include a coverage tag.
-- Calculate coverage per section, not per article.
-- Time-sensitive topics: lead Summary with date range of sources.
-- Do NOT delete stale content — flag it with date annotations. Old entries have historical value.
+### 交叉链接（必须遵守）
+- 正文中用 `[[OtherArticleName]]` 格式交叉引用其他文章
+- 例如: "详见 [[deep-learning]] 和 [[computer-vision]]"
+- 不包含 `.md` 扩展名
+- 每篇文章至少 2-3 个链接
 
-## Phase 4: Generate INDEX.md
+### 核心原则
+- **合成，不是复制**：从多个源提取关键信息，交叉引用，发现模式
+- **不要大段拷贝原文**：用自己的语言重新组织和表达
+- **每篇文章代表一个独立主题**：主题之间通过 `[[链接]]` 形成网络
 
-Create an INDEX.md in the output directory:
-
-```markdown
-# {Project Name} Knowledge Base
-
-Last compiled: {current date}
-Total topics: {count}
-
-## Topics
-
-| Topic | Sources | Status |
-|-------|---------|--------|
-| [{slug}]({slug}.md) | {count} | active |
-
-## Recent Changes
-- {date}: Initial compilation from {N} source files
-```
-
-## Phase 5: Log
-
-Create a log entry appended to `log.md`:
+## 第三阶段：生成 INDEX.md
 
 ```markdown
-## {current date}
+# {WorkspaceName} 知识库
 
-**Topics created:** {list}
-**Sources processed:** {count}
+最后编译: {today}
+主题数: {count}
+
+## 主题
+
+| 主题 | 来源数 |
+|------|--------|
+| [[topic-slug]] | N |
+
+## 最近变更
+- {today}: 首次编译
 ```
 
-## Output Format
+## 第四阶段：生成 log.md
 
-The compilation result must be a JSON array of output files:
+```markdown
+## {today}
 
+**创建的主题:** {list}
+**处理的源文件:** {count}
+```
+
+## 输出格式
+
+输出纯 JSON，不要额外说明：
 ```json
-{
-  "files": [
-    {
-      "path": "architecture.md",
-      "content": "# Architecture\n\n..."
-    },
-    {
-      "path": "INDEX.md",
-      "content": "# Knowledge Base\n\n..."
-    },
-    {
-      "path": "log.md",
-      "content": "## 2026-06-03\n\n..."
-    }
-  ]
-}
+{"files": [{"path": "article-name.md", "content": "# Title\n\n..."}]}
 ```
-
-- Each `path` is relative to the output directory.
-- `content` is the complete markdown content.
-- Always include INDEX.md and log.md in the output.
-- Files will be created via the backend API (`CreateTextFile`) and committed automatically.
-
-## Cross-Referencing Rules (Critical)
-
-Every article MUST link to related articles using `[[ArticleName]]` wiki links:
-
-- **Format**: `[[FileNameWithoutExtension]]`, e.g. `[[Deep-Learning]]`, `[[AI-Overview]]`
-- **In body text**: When discussing a related topic, link it: "see also [[Memory-Harness-Architecture]]"
-- **In INDEX.md**: The Topics table MUST link each entry with `[[slug]]`
-- **Every article**: Must contain at least 2-3 `[[links]]` to other articles
-
-Why this matters: The llmwiki knowledge graph parses these `[[wiki links]]` to build the graph visualization and enable backlinks. Without them, articles are isolated.
