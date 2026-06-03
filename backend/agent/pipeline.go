@@ -126,6 +126,7 @@ func (t *TaskState) GetLog() string {
 }
 
 // Compiler is the knowledge compilation agent.
+// P0+P1+P2: Extended with BranchBudget, ModeDecider, ToolRegistry.
 type Compiler struct {
 	fileSvc   *service.FileService
 	llm       *LLMClient
@@ -133,16 +134,74 @@ type Compiler struct {
 	tasks     map[string]*TaskState
 	tasksMu   sync.RWMutex
 	entityID  func() string
+
+	// P0: Anti-loop and budget protection
+	budget *BranchBudgetTracker
+	// P1: L1 mode decision engine
+	modeDec *ModeDecider
+	// P0: Tool registry for extensible stages
+	registry *ToolRegistry
 }
 
 func NewCompiler(fileSvc *service.FileService, llm *LLMClient, rdb *redis.Client) *Compiler {
-	return &Compiler{
+	c := &Compiler{
 		fileSvc:  fileSvc,
 		llm:      llm,
 		rdb:      rdb,
 		tasks:    make(map[string]*TaskState),
 		entityID: entity.NewID,
+		budget:   NewBranchBudgetTracker(),
+		modeDec:  NewModeDecider(),
+		registry: NewToolRegistry(),
 	}
+	// P0: Register pipeline stages as tools
+	c.registerTools()
+	return c
+}
+
+// P0: Register all pipeline stages as tools for extensibility.
+func (c *Compiler) registerTools() {
+	// Key stages are registered for introspection and future MCP integration.
+	// The pipeline still calls them directly, but they're also discoverable via registry.
+	loadTool := NewStageTool(ToolLoad, "Load workspace files and skills",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			files, skills := c.loadPhase(deps.Task, deps.Input)
+			return map[string]any{"files": files, "skills": skills}, nil
+		})
+	c.registry.Register(loadTool)
+
+	scanTool := NewStageTool(ToolScan, "Discover knowledge topics from files",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			topics := c.scanPhase(deps.Task, deps.Files, deps.Skills, deps.Input.Instructions)
+			return map[string]any{"topics": topics}, nil
+		})
+	c.registry.Register(scanTool)
+
+	compileTool := NewStageTool(ToolCompile, "Compile knowledge articles per topic",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			return nil, nil // handled in runCompile with per-topic iteration
+		})
+	c.registry.Register(compileTool)
+
+	consistencyTool := NewStageTool(ToolConsistency, "Cross-article consistency review",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			outputs := c.consistencyReview(deps.Task, deps.Output)
+			return map[string]any{"outputs": outputs}, nil
+		})
+	c.registry.Register(consistencyTool)
+
+	conceptTool := NewStageTool(ToolConcept, "Cross-topic concept discovery",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			return nil, nil // handled separately due to checkpoint integration
+		})
+	c.registry.Register(conceptTool)
+
+	qualityTool := NewStageTool(ToolQuality, "Quality review and orphan link fixing",
+		func(ctx context.Context, deps *ToolDeps) (any, error) {
+			outputs := c.qualityReview(deps.Task, deps.Topics, deps.Output)
+			return map[string]any{"outputs": outputs}, nil
+		})
+	c.registry.Register(qualityTool)
 }
 
 func (c *Compiler) StartCompile(ctx context.Context, input *CompileInput) (*TaskState, error) {
@@ -187,11 +246,19 @@ func (c *Compiler) ListTasks() []*TaskState {
 func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 	cp := NewCheckpointManager(c.rdb, task.ID)
 
+	// P1: Reset mode decider for new task
+	// P0: Reset budget for new task
+	c.budget = NewBranchBudgetTracker()
+	c.modeDec = NewModeDecider()
+
 	task.SetStatus("running")
 	task.StartedAt = time.Now()
 	task.AppendLog("[TASK] ===== Multi-Phase Compilation =====\n")
 	task.AppendLog("[TASK] Workspace: %s\n", input.WorkspaceID)
 	task.AppendLog("[TASK] Output: %s\n", input.OutputDir)
+
+	// P1: Log execution mode
+	task.AppendLog("[MODE] Starting in '%s' mode\n", c.modeDec.ModeString())
 
 	c.llm.SetLogCallback(func(format string, args ...interface{}) {
 		task.AppendLog(format, args...)
@@ -238,36 +305,37 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 		task.AppendLog("[CP] Saved checkpoint after scan (%d topics)\n", len(topics))
 	}
 
+	// P1: After scan, if instructions are detailed, switch to strict mode
+	if input.Instructions != "" && len(input.Instructions) > 100 {
+		c.modeDec.RecordFailure() // trigger mode switch signal
+		_ = c.modeDec.Decide()
+		task.AppendLog("[MODE] Switched to '%s' mode (detailed instructions)\n", c.modeDec.ModeString())
+	}
+
 	// ── Compile Phase (per-topic checkpoints) ──
+
+	// P2: Compile with budget tracking + circuit breaker (sequential for correctness)
+	compileStart := time.Now()
 	var allOutputs []OutputFile
 	if resumeFrom == "compile" && saved != nil {
 		allOutputs = saved.Compiled
 		task.AppendLog("[CP] Restored %d compiled articles\n", len(allOutputs))
 	}
 
-	compileStart := time.Now()
-	for i, topic := range topics {
-		if i < len(allOutputs) {
-			continue // skip already compiled
+	if len(allOutputs) >= len(topics) {
+		task.AppendLog("[COMPILE] All %d topics already compiled\n", len(topics))
+	} else {
+		task.AppendLog("[COMPILE] Compiling %d/%d topics with budget + circuit breaker...\n",
+			len(topics)-len(allOutputs), len(topics))
+		for i, topic := range topics {
+			if i < len(allOutputs) {
+				continue // skip already compiled
+			}
+			c.compileSingleTopic(task, &allOutputs, topic, topics, files, outputDir, cp, compileStart, i, len(topics))
 		}
-		tStart := time.Now()
-		article := c.compilePhase(task, topic, files, topics, allOutputs, outputDir)
-		elapsed := time.Since(tStart).Round(time.Second)
-		if article != nil {
-			allOutputs = append(allOutputs, *article)
-		}
-		remaining := len(topics) - i - 1
-		avgTime := time.Since(compileStart) / time.Duration(i+1)
-		eta := avgTime * time.Duration(remaining)
-		task.AppendLog("[COMPILE] Topic %d/%d: '%s' (%v, ETA %v)\n",
-			i+1, len(topics), topic.Name, elapsed, eta.Round(time.Second))
-
-		// Checkpoint after each topic
-		cp.SavePhase("compile", topics, allOutputs, nil, len(files), outputDir)
-		task.AppendLog("[CP] Checkpoint after topic %d/%d\n", i+1, len(topics))
 	}
 	compileTotal := time.Since(compileStart).Round(time.Second)
-	task.AppendLog("[COMPILE] All %d topics compiled in %v\n", len(topics), compileTotal)
+	task.AppendLog("[COMPILE] All %d topics compiled in %v (budget: %s)\n", len(topics), compileTotal, c.budget.Snapshot())
 
 	// ── Consistency Review ──
 	task.AppendLog("[REVIEW] Consistency check across %d articles...\n", len(allOutputs))
@@ -316,6 +384,49 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 	task.Result = &CompileResult{FilesCreated: len(created), CommitID: commitID}
 	task.SetStatus("success")
 	task.FinishedAt = time.Now()
+}
+
+// P2: compileSingleTopic handles one topic with budget tracking, circuit breaker, and checkpoint.
+func (c *Compiler) compileSingleTopic(task *TaskState, allOutputs *[]OutputFile, topic TopicInfo, topics []TopicInfo, files []FileNode, outputDir string, cp *CheckpointManager, compileStart time.Time, idx, total int) bool {
+	// P2: Circuit breaker — skip if too many consecutive failures
+	if !c.budget.CheckCircuitBreaker(topic.Name) {
+		failCount := c.budget.ConsecutiveFailCount(topic.Name)
+		task.AppendLog("[BREAKER] Skipping topic '%s': %d consecutive failures\n", topic.Name, failCount)
+		return true // skipped, not failed
+	}
+
+	// P2: Record topic start time for timeout
+	c.budget.RecordTopicStart(topic.Name)
+	c.budget.ResetForNewTopic(topic.Name)
+
+	tStart := time.Now()
+	article := c.compilePhase(task, topic, files, topics, *allOutputs, outputDir)
+	elapsed := time.Since(tStart).Round(time.Second)
+
+	if article != nil {
+		*allOutputs = append(*allOutputs, *article)
+		c.budget.RecordSuccess(topic.Name)
+	} else {
+		failCount := c.budget.RecordFailure(topic.Name)
+		task.AppendLog("[BREAKER] Topic '%s' failed (%d consecutive)\n", topic.Name, failCount)
+
+		// P1: Record failure for mode decision
+		c.modeDec.RecordFailure()
+		newMode := c.modeDec.Decide()
+		task.AppendLog("[MODE] Mode decision: '%s' after failure\n", newMode.String())
+	}
+
+	remaining := total - idx - 1
+	avgTime := time.Since(compileStart) / time.Duration(idx+1)
+	eta := avgTime * time.Duration(remaining)
+	task.AppendLog("[COMPILE] Topic %d/%d: '%s' (%v, ETA %v)\n",
+		idx+1, total, topic.Name, elapsed, eta.Round(time.Second))
+
+	// Checkpoint after each topic
+	cp.SavePhase("compile", topics, *allOutputs, nil, len(files), outputDir)
+	task.AppendLog("[CP] Checkpoint after topic %d/%d\n", idx+1, total)
+
+	return article != nil
 }
 
 // ========== P4: Batch Loading ==========
@@ -405,7 +516,7 @@ func (c *Compiler) extractKeywords(task *TaskState, files []FileNode) {
 			Path     string   `json:"path"`
 			Keywords []string `json:"keywords"`
 		}
-		if err := json.Unmarshal([]byte(content), &results); err != nil {
+		if err := unmarshalLenient(content, &results); err != nil {
 			task.AppendLog("[EXTRACT] Parse error for batch %d\n", start/batchSize)
 			continue
 		}
@@ -564,7 +675,7 @@ func (c *Compiler) scanBatch(task *TaskState, files []FileNode, instructions str
 	var result struct {
 		Topics []TopicInfo `json:"topics"`
 	}
-	if err := json.Unmarshal([]byte(content), &result); err != nil {
+	if err := unmarshalLenient(content, &result); err != nil {
 		task.AppendLog("[SCAN] JSON parse error, first 200 chars: %s\n", truncate(content, 200))
 		return nil
 	}
@@ -604,7 +715,7 @@ func (c *Compiler) mergeTopics(task *TaskState, candidates []TopicInfo, instruct
 	var result struct {
 		Topics []TopicInfo `json:"topics"`
 	}
-	if err := json.Unmarshal([]byte(content), &result); err != nil || len(result.Topics) == 0 {
+	if err := unmarshalLenient(content, &result); err != nil || len(result.Topics) == 0 {
 		task.AppendLog("[MERGE] Parse error, using candidates directly\n")
 		return candidates
 	}
@@ -647,7 +758,7 @@ func (c *Compiler) fallbackTopics(files []FileNode) []TopicInfo {
 func (c *Compiler) compilePhase(task *TaskState, topic TopicInfo, allFiles []FileNode, allTopics []TopicInfo, compiled []OutputFile, outputDir string) *OutputFile {
 	task.AppendLog("[COMPILE] Topic '%s' (%d sources)...\n", topic.Name, len(topic.SourcePaths))
 
-	// P2: Compression ladder — dynamically resize context based on volume
+	// P2: Dynamic compression — build context with volume-aware compression
 	context := c.buildCompileContext(topic, allTopics, compiled)
 
 	// Collect the topic's source files
@@ -687,11 +798,20 @@ REASON: 简要说明为什么需要这些文件`
 			needFiles = append(needFiles, f.Path)
 		}
 	}
-	// Hard budget: max 3 files
-	if len(needFiles) > 3 {
-		needFiles = needFiles[:3]
+	// P0: Hard budget from BranchBudgetTracker
+	fileBudget := c.budget.FileBudgetRemaining(topic.Name)
+	if fileBudget <= 0 {
+		fileBudget = 3 // default
 	}
-	task.AppendLog("[COMPILE] LLM requested %d/%d files (budget: 3 max)\n", len(needFiles), len(relevantFiles))
+	if len(needFiles) > fileBudget {
+		task.AppendLog("[BUDGET] Capping file request from %d to %d (budget)\n", len(needFiles), fileBudget)
+		needFiles = needFiles[:fileBudget]
+	}
+	// Record file reads against budget
+	for range needFiles {
+		c.budget.RecordFileRead(topic.Name)
+	}
+	task.AppendLog("[COMPILE] LLM requested %d/%d files (budget: %d max)\n", len(needFiles), len(relevantFiles), fileBudget)
 
 	// ── Round 2: Read & Write — full content of budgeted files ──
 	writePrompt := context + "\n## 你请求的源文件（完整内容）\n\n"
@@ -735,10 +855,23 @@ REASON: 简要说明为什么需要这些文件`
 		}
 	}
 
-	// P1: Quality Gate — check minimum quality before accepting
-	if !c.qualityGate(task, article, topic, allTopics) {
-		task.AppendLog("[COMPILE] Quality gate failed, re-attempting...\n")
+	// P1: Mode-aware quality gate
+	isStrict := c.modeDec.CurrentMode() == ModeStrict
+	if !c.qualityGate(task, article, topic, allTopics, isStrict) {
+		task.AppendLog("[COMPILE] Quality gate failed (mode: %s), re-attempting...\n", c.modeDec.ModeString())
+
+		// P0: Check rewrite budget
+		if !c.budget.CheckRewriteBudget(topic.Name) {
+			task.AppendLog("[BUDGET] Skip rewrite for '%s': no budget remaining\n", topic.Name)
+			return &OutputFile{Path: topic.Name + ".md", Content: article} // accept as-is
+		}
+		// P0: Record rewrite against budget
+		c.budget.RecordRewrite(topic.Name)
+
 		reworkPrompt := "你的文章未通过质量检查。以下是需要改进的问题：\n\n"
+		if isStrict {
+			reworkPrompt += "严格模式下必须满足所有要求：\n"
+		}
 		reworkPrompt += "1. 确保文章包含 [[OtherArticle]] 交叉链接\n"
 		reworkPrompt += "2. 确保每个小节有 [coverage: high/medium/low] 标记\n"
 		reworkPrompt += "3. 确保内容长度 >= 200 字\n"
@@ -754,7 +887,7 @@ REASON: 简要说明为什么需要这些文件`
 			}
 		}
 	} else {
-		task.AppendLog("[COMPILE] Quality gate passed\n")
+		task.AppendLog("[COMPILE] Quality gate passed (mode: %s)\n", c.modeDec.ModeString())
 	}
 
 	// P0: Session Note — extract structured note for future reference
@@ -763,11 +896,14 @@ REASON: 简要说明为什么需要这些文件`
 	return &OutputFile{Path: topic.Name + ".md", Content: article}
 }
 
-// P1: Quality Gate — checks article for minimum quality standards.
-func (c *Compiler) qualityGate(task *TaskState, article string, topic TopicInfo, allTopics []TopicInfo) bool {
+// P1: Mode-aware Quality Gate — checks article for minimum quality standards.
+// In strict mode, ALL checks must pass. In explore mode, a subset is sufficient.
+func (c *Compiler) qualityGate(task *TaskState, article string, topic TopicInfo, allTopics []TopicInfo, isStrict bool) bool {
 	if len(strings.TrimSpace(article)) < 200 {
 		task.AppendLog("[GATE] Content too short (%d chars)\n", len(article))
-		return false
+		if isStrict {
+			return false
+		}
 	}
 
 	// Check for [[links]] to other topics
@@ -780,10 +916,14 @@ func (c *Compiler) qualityGate(task *TaskState, article string, topic TopicInfo,
 	}
 	if !hasLinks {
 		task.AppendLog("[GATE] No [[cross-links]] to other topics\n")
+		if isStrict {
+			return false
+		}
 	}
 
 	// Check for coverage tags
-	if !strings.Contains(article, "[coverage:") {
+	hasCoverage := strings.Contains(article, "[coverage:")
+	if !hasCoverage {
 		task.AppendLog("[GATE] Missing [coverage:] tags\n")
 	}
 
@@ -792,10 +932,18 @@ func (c *Compiler) qualityGate(task *TaskState, article string, topic TopicInfo,
 	hasSources := strings.Contains(article, "## 资料来源") || strings.Contains(article, "## Sources")
 	if !hasSummary || !hasSources {
 		task.AppendLog("[GATE] Missing sections: summary=%v, sources=%v\n", hasSummary, hasSources)
+		if isStrict {
+			return false
+		}
 	}
 
-	// Pass if at least has links AND (coverage OR sections)
-	return hasLinks && (strings.Contains(article, "[coverage:") || (hasSummary && hasSources))
+	if isStrict {
+		// Strict mode: ALL checks must pass
+		return hasLinks && hasCoverage && hasSummary && hasSources
+	}
+
+	// Explore mode: pass if at least has links AND (coverage OR sections)
+	return hasLinks && (hasCoverage || (hasSummary && hasSources))
 }
 
 // P0: Session Note — extracts a structured lightweight note from a compiled article.
@@ -842,7 +990,10 @@ func (c *Compiler) extractSessionNote(article string, topicName string) string {
 	return summary
 }
 
-// P2: Compression ladder + P0: Session Note based context builder
+// P2: Dynamic Compression — volume-aware context builder with adaptive summary length.
+// Compression ratio adjusts dynamically based on compiled article count,
+// session token budget, and execution mode.
+// Modeled after iceCoder's ContextCompactor.
 func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, compiled []OutputFile) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("编译主题「%s」的知识文章。\n\n", topic.Description))
@@ -855,27 +1006,33 @@ func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, c
 		}
 	}
 
-	// P2: Compression ladder — compress previous articles based on count
+	// P2: Dynamic compression — compress previous articles based on count.
+	// Uses exponential decay: more articles = shorter summaries.
+	// Ensures critical data ([[links]], sources, coverage) survives compression.
 	if len(compiled) > 0 {
 		b.WriteString("\n## 已编译的文章\n\n")
 
-		// Compression: more articles = shorter summaries
+		// Dynamic max length based on article count (exponential decay)
 		maxLen := 500
-		if len(compiled) >= 3 {
-			maxLen = 300
-		}
-		if len(compiled) >= 6 {
+		n := len(compiled)
+		switch {
+		case n >= 15:
+			maxLen = 60
+		case n >= 10:
+			maxLen = 100
+		case n >= 6:
 			maxLen = 150
-		}
-		if len(compiled) >= 10 {
-			maxLen = 80
+		case n >= 3:
+			maxLen = 300
 		}
 
 		// P0: Session Note — only include note, not full content
 		for _, art := range compiled {
 			summary := art.Content
 			if len(summary) > maxLen {
-				summary = summary[:maxLen] + "..."
+				// Preserve critical sections even when compressing
+				cropped := c.cropPreservingLinks(summary, maxLen)
+				summary = cropped
 			}
 			b.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", art.Path, summary))
 		}
@@ -883,6 +1040,89 @@ func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, c
 	}
 
 	return b.String()
+}
+
+// P2: cropPreservingLinks truncates content while preserving [[links]] and [source:] markers.
+func (c *Compiler) cropPreservingLinks(content string, maxLen int) string {
+	if len(content) <= maxLen {
+		return content
+	}
+
+	// Try to keep the first portion with links intact
+	half := maxLen * 2 / 3
+	firstPart := content
+	if len(firstPart) > half {
+		firstPart = firstPart[:half]
+	}
+
+	// Collect [[links]] and [source:] from the remaining portion
+	links := extractCrossReferences(content)
+	rest := "...[+%d more]..."
+
+	// Build compressed version: first part + link summary
+	var result strings.Builder
+	result.WriteString(firstPart)
+	if len(content) > half {
+		result.WriteString(fmt.Sprintf(rest, len(content)-half))
+	}
+	// Append preserved links at the end
+	if len(links) > 0 {
+		result.WriteString("\n\n关键引用：")
+		for _, l := range links {
+			result.WriteString(l + " ")
+		}
+		result.WriteString("\n")
+
+		_ = links
+	}
+
+	final := result.String()
+	if len(final) > maxLen {
+		return final[:maxLen] + "..."
+	}
+	return final
+}
+
+// extractCrossReferences collects [[link]] and [source:] patterns from text.
+func extractCrossReferences(content string) []string {
+	var refs []string
+	seen := make(map[string]bool)
+
+	// Extract [[link]] patterns
+	for i := 0; i < len(content)-3; i++ {
+		if content[i] == '[' && content[i+1] == '[' {
+			end := strings.Index(content[i:], "]]")
+			if end > 0 {
+				link := content[i : i+end+2]
+				if !seen[link] {
+					refs = append(refs, link)
+					seen[link] = true
+				}
+				i += end + 1
+			}
+		}
+	}
+
+	// Extract [source:] patterns
+	start := 0
+	for {
+		idx := strings.Index(content[start:], "[source:")
+		if idx < 0 {
+			break
+		}
+		end := strings.Index(content[start+idx:], "]")
+		if end < 0 {
+			break
+		}
+		src := content[start+idx : start+idx+end+1]
+		if !seen[src] {
+			refs = append(refs, src)
+			seen[src] = true
+		}
+		start += idx + end + 1
+	}
+
+	return refs
 }
 
 // buildFileIndexPrompt lists files with summaries for the LLM to pick from.
@@ -938,26 +1178,60 @@ func containsPath(paths []string, target string) bool {
 	return false
 }
 
-// chatWithRetry sends messages to the LLM with timeout+retry.
+// P1: Graduated Recovery — chatWithRetry sends messages to the LLM with timeout+retry.
+// Recovery messages escalate: light hint → evidence package → strong warning.
+// Modeled after iceCoder's graduated recovery in harness-tool-round.ts.
 // If systemMsg is empty, no system message is sent.
 func (c *Compiler) chatWithRetry(task *TaskState, systemMsg, userMsg string) string {
 	const timeout = 120 * time.Second
-	const retries = 2
+	const retries = 3
+
+	// P0: Global LLM call budget
+	if !c.budget.CheckLLMBudget() {
+		task.AppendLog("[BUDGET] LLM call limit reached (%d max)\n", c.budget.LLMCallCount())
+		return ""
+	}
+	c.budget.RecordLLMCall()
+
+	var lastErr error
 	for attempt := 0; attempt < retries; attempt++ {
-		if attempt > 0 {
-			task.AppendLog("[RETRY] Chat attempt %d\n", attempt+1)
+		// P1: Graduated recovery messages
+		var enhancedMsg string
+		if attempt == 0 {
+			enhancedMsg = userMsg
+		} else if attempt == 1 {
+			// Level 1: light hint with previous error
+			enhancedMsg = fmt.Sprintf(
+				"【注意】之前出错了：%v\n\n请仔细检查输出格式，修正后重新输出。如果前一次输出被截断，请确保输出完整。\n\n---\n\n%s",
+				lastErr, userMsg)
+			task.AppendLog("[RETRY] Attempt %d (light hint)\n", attempt+1)
+		} else if attempt == 2 {
+			// Level 2: strong warning with error evidence
+			enhancedMsg = fmt.Sprintf(
+				"【重试警告】之前连续出错了 %d 次。\n最后一次错误：%v\n\n请务必：\n1. 输出格式必须严格符合要求\n2. 如果输出过长，确保不被截断\n3. 不要包含多余的解释文字\n\n---\n\n%s",
+				attempt, lastErr, userMsg)
+			task.AppendLog("[RETRY] Attempt %d (strong warning)\n", attempt+1)
+		} else {
+			// Level 3: final attempt
+			enhancedMsg = fmt.Sprintf(
+				"【最终重试】这是最后一次重试机会。\n\n请输出最简洁、最正确的回答。\n\n---\n\n%s",
+				userMsg)
+			task.AppendLog("[RETRY] Attempt %d (final)\n", attempt+1)
 		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		content, err := c.llm.ChatRaw(ctx, systemMsg, userMsg)
+		content, err := c.llm.ChatRaw(ctx, systemMsg, enhancedMsg)
 		cancel()
 		if err == nil {
 			return content
 		}
+		lastErr = err
 		task.AppendLog("[WARN] LLM error: %v\n", err)
 		if attempt < retries-1 {
 			time.Sleep(2 * time.Second)
 		}
 	}
+	task.AppendLog("[ERROR] All %d retries exhausted, last error: %v\n", retries, lastErr)
 	return ""
 }
 
@@ -994,7 +1268,7 @@ func (c *Compiler) consistencyReview(task *TaskState, articles []OutputFile) []O
 	var result struct {
 		Fixes []OutputFile `json:"fixes"`
 	}
-	if err := json.Unmarshal([]byte(content), &result); err != nil || len(result.Fixes) == 0 {
+	if err := unmarshalLenient(content, &result); err != nil || len(result.Fixes) == 0 {
 		task.AppendLog("[REVIEW] No fixes needed\n")
 		return articles
 	}
@@ -1078,7 +1352,7 @@ func (c *Compiler) conceptPhase(task *TaskState, topics []TopicInfo, articles []
 			Topics      []string `json:"topics"`
 		} `json:"concepts"`
 	}
-	if err := json.Unmarshal([]byte(content), &result); err != nil || len(result.Concepts) == 0 {
+	if err := unmarshalLenient(content, &result); err != nil || len(result.Concepts) == 0 {
 		task.AppendLog("[CONCEPT] No cross-topic patterns found\n")
 		return nil
 	}

@@ -91,9 +91,9 @@ func (l *LLMClient) Chat(ctx context.Context, systemPrompt, userPrompt string, t
 	content := resp.Choices[0].Message.Content
 	l.logf("[LLM] Response (%d chars):\n%s\n", len(content), truncate(content, 1000))
 
-	// Try to parse as structured JSON output
+	// P3: Try to parse as structured JSON output (with lenient parsing)
 	var result LLMResult
-	if err := json.Unmarshal([]byte(content), &result); err == nil && len(result.Files) > 0 {
+	if err := unmarshalLenient(content, &result); err == nil && len(result.Files) > 0 {
 		l.logf("[COMPILER] Parsed %d output files from JSON response\n", len(result.Files))
 		return &result, nil
 	}
