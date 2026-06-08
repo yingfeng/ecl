@@ -28,6 +28,7 @@ Thumbs.db
 *~
 .project
 .classpath
+.codebuddy
 
 *.tmp
 *.temp

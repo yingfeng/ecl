@@ -2,13 +2,9 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
-
-	"github.com/cloudwego/eino/components/tool"
-	"github.com/cloudwego/eino/schema"
 )
 
 // ========== Agent State ==========
@@ -38,32 +34,14 @@ func (s *AgentState) appendLog(format string, args ...interface{}) {
 	}
 }
 
-// ========== Tool adapter ==========
+// ========== Tool type ==========
 
-// ToolInfoToCallable converts a function into an InvokableTool.
-func ToolInfoToCallable(name, desc string, fn func(ctx context.Context, argsJSON string) (string, error)) tool.InvokableTool {
-	return &adapterTool{
-		name: name,
-		desc: desc,
-		fn:   fn,
-	}
-}
-
-type adapterTool struct {
-	name string
-	desc string
-	fn   func(ctx context.Context, argsJSON string) (string, error)
-}
-
-func (t *adapterTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
-	return &schema.ToolInfo{
-		Name: t.name,
-		Desc: t.desc,
-	}, nil
-}
-
-func (t *adapterTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
-	return t.fn(ctx, argumentsInJSON)
+// ToolFunc defines a tool available to the LLM agent.
+// The Run function receives JSON arguments and returns a JSON result string.
+type ToolFunc struct {
+	Name        string
+	Description string
+	Run         func(ctx context.Context, argsJSON string) (string, error)
 }
 
 // ========== Tool name constants ==========
@@ -81,66 +59,17 @@ const (
 	ToolAppendNote    = "append_mapping_note"
 )
 
-// ========== Tool result helpers ==========
-
-func toolResultOK(status string) string {
-	data, _ := json.Marshal(map[string]string{"status": status})
-	return string(data)
-}
-
 func usage(desc string) string {
 	return fmt.Sprintf("工具说明：\n%s\n\n调用时传入JSON参数。", desc)
-}
-
-// ========== Summarizers ==========
-
-func summarizeFiles(files []FileNode) []map[string]any {
-	result := make([]map[string]any, 0, len(files))
-	for _, f := range files {
-		summary := f.Content
-		if len(summary) > 200 {
-			summary = summary[:200] + "..."
-		}
-		result = append(result, map[string]any{
-			"path":    f.Path,
-			"title":   f.Title,
-			"summary": summary,
-			"size":    len(f.Content),
-		})
-	}
-	return result
-}
-
-func summarizeSkills(skills []SkillDef) []map[string]any {
-	result := make([]map[string]any, 0, len(skills))
-	for _, s := range skills {
-		result = append(result, map[string]any{
-			"name":    s.Name,
-			"content": truncate(s.Content, 300),
-		})
-	}
-	return result
-}
-
-func topicNames(topics []TopicInfo) []string {
-	names := make([]string, len(topics))
-	for i, t := range topics {
-		names[i] = t.Name
-	}
-	return names
 }
 
 // ========== Tool call executor ==========
 
 // executeToolCall finds and executes a tool by name.
-func executeToolCall(tools []tool.InvokableTool, name string, argsJSON string) string {
+func executeToolCall(tools []ToolFunc, name string, argsJSON string) string {
 	for _, t := range tools {
-		info, err := t.Info(context.Background())
-		if err != nil {
-			continue
-		}
-		if info.Name == name {
-			result, err := t.InvokableRun(context.Background(), argsJSON)
+		if t.Name == name {
+			result, err := t.Run(context.Background(), argsJSON)
 			if err != nil {
 				return fmt.Sprintf("错误: %v", err)
 			}
@@ -151,14 +80,10 @@ func executeToolCall(tools []tool.InvokableTool, name string, argsJSON string) s
 }
 
 // formatToolDescriptions creates a string listing all available tools for the prompt.
-func formatToolDescriptions(tools []tool.InvokableTool) string {
+func formatToolDescriptions(tools []ToolFunc) string {
 	var b strings.Builder
 	for _, t := range tools {
-		info, err := t.Info(context.Background())
-		if err != nil {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("- **%s**: %s", info.Name, info.Desc))
+		b.WriteString(fmt.Sprintf("- **%s**: %s", t.Name, t.Description))
 		b.WriteString("\n")
 	}
 	return b.String()

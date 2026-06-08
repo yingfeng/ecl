@@ -6,32 +6,32 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cloudwego/eino/schema"
 	"github.com/go-redis/redis/v8"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 const (
-	cpPrefix     = "llmwiki:cp:"
-	cpTTL        = 24 * time.Hour
+	cpPrefix = "llmwiki:cp:"
+	cpTTL    = 24 * time.Hour
 )
 
 // Checkpoint stores compilation state for resume support.
 type Checkpoint struct {
-	TaskID    string        `json:"task_id"`
-	Phase     string        `json:"phase"` // "scan","compile","concept","index","write","agent_turn_N"
-	Topics    []TopicInfo   `json:"topics,omitempty"`
-	Compiled  []OutputFile  `json:"compiled,omitempty"`
+	TaskID    string       `json:"task_id"`
+	Phase     string       `json:"phase"` // "scan","compile","concept","index","write","agent_turn_N"
+	Topics    []TopicInfo  `json:"topics,omitempty"`
+	Compiled  []OutputFile `json:"compiled,omitempty"`
 	AllOutputs []OutputFile `json:"all_outputs,omitempty"`
-	FileCount int           `json:"file_count"`
-	OutputDir string        `json:"output_dir"`
+	FileCount int          `json:"file_count"`
+	OutputDir string       `json:"output_dir"`
 
 	// Agent loop checkpoint fields
 	TurnCount   int    `json:"turn_count,omitempty"`
-	MessagesRaw string `json:"messages_raw,omitempty"`  // JSON-encoded []*schema.Message
-	FilesRaw    string `json:"files_raw,omitempty"`      // JSON-encoded []FileNode
-	SkillsRaw   string `json:"skills_raw,omitempty"`     // JSON-encoded []SkillDef
-	TopicsRaw   string `json:"topics_raw,omitempty"`     // JSON-encoded []TopicInfo
-	OutputsRaw  string `json:"outputs_raw,omitempty"`    // JSON-encoded []OutputFile
+	MessagesRaw string `json:"messages_raw,omitempty"` // JSON-encoded []openai.ChatCompletionMessage
+	FilesRaw    string `json:"files_raw,omitempty"`
+	SkillsRaw   string `json:"skills_raw,omitempty"`
+	TopicsRaw   string `json:"topics_raw,omitempty"`
+	OutputsRaw  string `json:"outputs_raw,omitempty"`
 }
 
 // CheckpointManager handles save/load/resume via Redis.
@@ -94,8 +94,7 @@ func (m *CheckpointManager) SavePhase(phase string, topics []TopicInfo, compiled
 // ========== Agent Loop Checkpoint ==========
 
 // SaveAgentCheckpoint saves the full agent loop state.
-func (m *CheckpointManager) SaveAgentCheckpoint(turnCount int, messages []*schema.Message, state *AgentState) error {
-	// Serialize messages to JSON
+func (m *CheckpointManager) SaveAgentCheckpoint(turnCount int, messages []openai.ChatCompletionMessage, state *AgentState) error {
 	msgsRaw, _ := json.Marshal(messages)
 	filesRaw, _ := json.Marshal(state.Files)
 	skillsRaw, _ := json.Marshal(state.Skills)
@@ -116,14 +115,14 @@ func (m *CheckpointManager) SaveAgentCheckpoint(turnCount int, messages []*schem
 
 // LoadAgentCheckpoint restores agent loop state from checkpoint.
 // Returns (turnCount, messages, restored, error).
-func (m *CheckpointManager) LoadAgentCheckpoint() (int, []*schema.Message, *AgentState, error) {
+func (m *CheckpointManager) LoadAgentCheckpoint() (int, []openai.ChatCompletionMessage, *AgentState, error) {
 	cp, err := m.Load()
 	if err != nil || cp == nil {
 		return 0, nil, nil, err
 	}
 
 	// Restore messages
-	var messages []*schema.Message
+	var messages []openai.ChatCompletionMessage
 	if cp.MessagesRaw != "" {
 		if err := json.Unmarshal([]byte(cp.MessagesRaw), &messages); err != nil {
 			return 0, nil, nil, fmt.Errorf("unmarshal messages: %w", err)

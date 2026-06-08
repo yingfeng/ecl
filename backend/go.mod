@@ -12,28 +12,13 @@ require (
 	gorm.io/gorm v1.25.10
 )
 
-require (
-	github.com/bahlo/generic-list-go v0.2.0 // indirect
-	github.com/buger/jsonparser v1.1.1 // indirect
-	github.com/eino-contrib/jsonschema v1.0.3 // indirect
-	github.com/goph/emperror v0.17.2 // indirect
-	github.com/mailru/easyjson v0.7.7 // indirect
-	github.com/nikolalohinski/gonja v1.5.3 // indirect
-	github.com/pkg/errors v0.9.1 // indirect
-	github.com/sirupsen/logrus v1.9.3 // indirect
-	github.com/slongfield/pyfmt v0.0.0-20220222012616-ea85ff4c361f // indirect
-	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
-	github.com/yargevad/filepathx v1.0.0 // indirect
-	golang.org/x/exp v0.0.0-20230713183714-613f0c0eb8a1 // indirect
-)
+require github.com/cloudwego/base64x v0.1.6 // indirect
 
 require (
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
-	github.com/cloudwego/base64x v0.1.6 // indirect
-	github.com/cloudwego/eino v0.0.0
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.3 // indirect
@@ -68,4 +53,5 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 )
 
-replace github.com/cloudwego/eino => /home/infominer/codebase/eino
+// harness-go replaces eino as the agent framework
+replace github.com/infiniflow/ragflow/harness => /home/infominer/codebase/harness-go

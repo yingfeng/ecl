@@ -7,9 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cloudwego/eino/components/model"
-	"github.com/cloudwego/eino/components/tool"
-	"github.com/cloudwego/eino/schema"
+	openai "github.com/sashabaranov/go-openai"
 )
 
 // ========== Agent Loop: Claude Code-style ==========
@@ -39,25 +37,15 @@ type AgentResult struct {
 func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 	start := time.Now()
 
-	// 1. Create ChatModel
-	chatModel := NewDeepSeekChatModel(cfg.LLM)
-
-	// 2. Build system prompt from SKILL.md
+	// 1. Build system prompt from SKILL.md
 	systemPrompt := buildSystemPrompt(cfg)
 
-	// 3. Create tool instances and collect ToolInfo for function calling
+	// 2. Create tool instances and collect OpenAI Tool definitions
 	compiler := &Compiler{}
 	agentTools := createAgentTools(compiler)
+	openaiTools := buildOpenAITools(agentTools)
 
-	var toolInfos []*schema.ToolInfo
-	for _, t := range agentTools {
-		info, err := t.Info(ctx)
-		if err == nil {
-			toolInfos = append(toolInfos, info)
-		}
-	}
-
-	// 4. Try checkpoint resume
+	// 3. Try checkpoint resume
 	maxTurns := 30
 	turnCount := 0
 	autoExecCount := 0
@@ -67,7 +55,7 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 		userContent = "请按照上述工作流程，逐步执行知识编译任务。"
 	}
 
-	var messages []*schema.Message
+	var messages []openai.ChatCompletionMessage
 
 	if cfg.CP != nil {
 		if restoredTurn, restoredMsgs, restoredState, err := cfg.CP.LoadAgentCheckpoint(); err == nil && restoredState != nil {
@@ -84,13 +72,13 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 			Input: &CompileInput{WorkspaceID: cfg.WorkspaceID},
 			Task:  &TaskState{ID: "agent", Status: "running", Log: ""},
 		}
-		messages = []*schema.Message{
-			schema.SystemMessage(systemPrompt),
-			schema.UserMessage(userContent),
+		messages = []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: systemPrompt},
+			{Role: openai.ChatMessageRoleUser, Content: userContent},
 		}
 	}
 
-	// 5. Save checkpoint function
+	// 4. Save checkpoint function
 	saveCP := func() {
 		if cfg.CP != nil {
 			if err := cfg.CP.SaveAgentCheckpoint(turnCount, messages, globalState); err != nil {
@@ -103,25 +91,44 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 		turnCount++
 		globalState.appendLog("[TURN %d] LLM reasoning...\n", turnCount)
 
-		// Pass tool definitions to the LLM via model.WithTools (proper function calling)
-		resp, err := chatModel.Generate(ctx, messages, model.WithTools(toolInfos))
+		// Call LLM with tool definitions
+		resp, err := cfg.LLM.ChatWithToolCalls(ctx, messages, openaiTools)
 		if err != nil {
 			globalState.appendLog("[ERROR] LLM call failed: %v\n", err)
 			break
 		}
 
-		if len(resp.ToolCalls) > 0 {
-			// LLM returned structured tool calls via function calling
-			assistantMsg := schema.AssistantMessage(resp.Content, resp.ToolCalls)
-			messages = append(messages, assistantMsg)
-			globalState.appendLog("[TURN %d] LLM called %d tool(s)\n", turnCount, len(resp.ToolCalls))
+		if len(resp.Choices) == 0 {
+			globalState.appendLog("[ERROR] No choices in response\n")
+			break
+		}
 
-			for _, tc := range resp.ToolCalls {
-				globalState.appendLog("  -> tool: %s\n", tc.Function.Name)
-				result := executeToolCall(agentTools, tc.Function.Name, tc.Function.Arguments)
+		choice := resp.Choices[0].Message
+
+		if len(choice.ToolCalls) > 0 {
+			// LLM returned structured tool calls via function calling
+			assistantMsg := openai.ChatCompletionMessage{
+				Role:      openai.ChatMessageRoleAssistant,
+				Content:   choice.Content,
+				ToolCalls: choice.ToolCalls,
+			}
+			messages = append(messages, assistantMsg)
+			globalState.appendLog("[TURN %d] LLM called %d tool(s)\n", turnCount, len(choice.ToolCalls))
+
+			for _, tc := range choice.ToolCalls {
+				toolName := tc.Function.Name
+				argsJSON := tc.Function.Arguments
+				globalState.appendLog("  -> tool: %s\n", toolName)
+
+				result := executeToolCall(agentTools, toolName, argsJSON)
 				globalState.appendLog("  <- result: %s\n", truncate(result, 100))
 
-				toolMsg := schema.ToolMessage(result, tc.ID)
+				toolMsg := openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    result,
+					Name:       toolName,
+					ToolCallID: tc.ID,
+				}
 				messages = append(messages, toolMsg)
 			}
 
@@ -134,23 +141,31 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 			}
 		} else {
 			// No tool calls — LLM responded in text
-			globalState.appendLog("[TURN %d] LLM response: %s\n", turnCount, truncate(resp.Content, 200))
-			messages = append(messages, schema.AssistantMessage(resp.Content, nil))
+			globalState.appendLog("[TURN %d] LLM response: %s\n", turnCount, truncate(choice.Content, 200))
+			messages = append(messages, openai.ChatCompletionMessage{
+				Role:    openai.ChatMessageRoleAssistant,
+				Content: choice.Content,
+			})
 
 			// Completion check
-			if isCompletionText(resp.Content) {
+			if isCompletionText(choice.Content) {
 				globalState.appendLog("[DONE] LLM indicated completion\n")
 				break
 			}
 
 			// Auto-execute: detect tool call intent in text and skip next decision round
-			if toolName, argsJSON, found := parseToolIntent(resp.Content); found && autoExecCount < 3 {
+			if toolName, argsJSON, found := parseToolIntent(choice.Content); found && autoExecCount < 3 {
 				autoExecCount++
 				globalState.appendLog("[AUTO] Detected '%s' in text, executing directly\n", toolName)
 				result := executeToolCall(agentTools, toolName, argsJSON)
 				globalState.appendLog("  <- auto result: %s\n", truncate(result, 100))
 
-				messages = append(messages, schema.ToolMessage(result, "auto_"+toolName))
+				messages = append(messages, openai.ChatCompletionMessage{
+					Role:       openai.ChatMessageRoleTool,
+					Content:    result,
+					Name:       toolName,
+					ToolCallID: "auto_" + toolName,
+				})
 
 				// Save checkpoint after auto-execution
 				saveCP()
@@ -168,7 +183,7 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 			}
 		}
 
-		// 6. Context compression: prevent unbounded message growth
+		// 5. Context compression: prevent unbounded message growth
 		messages = compressContext(messages, 24)
 
 		// Save checkpoint after compression (reduced size)
@@ -195,11 +210,28 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 	}, nil
 }
 
+// buildOpenAITools converts ToolFunc slice to OpenAI Tool slice.
+func buildOpenAITools(tools []ToolFunc) []openai.Tool {
+	result := make([]openai.Tool, 0, len(tools))
+	for _, t := range tools {
+		result = append(result, openai.Tool{
+			Type: openai.ToolTypeFunction,
+			Function: &openai.FunctionDefinition{
+				Name:        t.Name,
+				Description: t.Description,
+			},
+		})
+	}
+	return result
+}
+
 // createAgentTools builds the list of tools available to the LLM.
-func createAgentTools(compiler *Compiler) []tool.InvokableTool {
-	return []tool.InvokableTool{
-		ToolInfoToCallable("load_files", usage("加载工作区文件。需要 workspace_id。返回文件摘要。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+func createAgentTools(compiler *Compiler) []ToolFunc {
+	return []ToolFunc{
+		{
+			Name: "load_files",
+			Description: usage("加载工作区文件。需要 workspace_id。返回文件摘要。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				var args struct {
 					WorkspaceID string `json:"workspace_id"`
 				}
@@ -219,10 +251,12 @@ func createAgentTools(compiler *Compiler) []tool.InvokableTool {
 				}
 				data, _ := json.Marshal(result)
 				return string(data), nil
-			}),
-
-		ToolInfoToCallable("read_file", usage("读取指定源文件的完整内容。需要 file_path。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "read_file",
+			Description: usage("读取指定源文件的完整内容。需要 file_path。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				var args struct {
 					FilePath string `json:"file_path"`
 				}
@@ -236,24 +270,30 @@ func createAgentTools(compiler *Compiler) []tool.InvokableTool {
 					}
 				}
 				return fmt.Sprintf("未找到: %s", args.FilePath), nil
-			}),
-
-		ToolInfoToCallable("extract_keywords", usage("从已加载文件中提取关键词。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "extract_keywords",
+			Description: usage("从已加载文件中提取关键词。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				compiler.extractKeywords(globalState.Task, globalState.Files)
 				return fmt.Sprintf("已提取 %d 个文件的关键词", len(globalState.Files)), nil
-			}),
-
-		ToolInfoToCallable("scan_topics", usage("扫描文件发现知识主题。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "scan_topics",
+			Description: usage("扫描文件发现知识主题。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				topics := compiler.scanPhase(globalState.Task, globalState.Files, globalState.Skills, globalState.Input.Instructions)
 				globalState.Topics = topics
 				data, _ := json.MarshalIndent(topics, "", "  ")
 				return fmt.Sprintf("发现 %d 个主题:\n%s", len(topics), string(data)), nil
-			}),
-
-		ToolInfoToCallable("compile_topic", usage("编译单个主题的知识文章。需要 topic_name。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "compile_topic",
+			Description: usage("编译单个主题的知识文章。需要 topic_name。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				var args struct {
 					TopicName string `json:"topic_name"`
 				}
@@ -273,44 +313,56 @@ func createAgentTools(compiler *Compiler) []tool.InvokableTool {
 					}
 				}
 				return fmt.Sprintf("未找到主题: %s", args.TopicName), nil
-			}),
-
-		ToolInfoToCallable("consistency_review", usage("对所有已编译文章进行一致性审查。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "consistency_review",
+			Description: usage("对所有已编译文章进行一致性审查。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				if len(globalState.Outputs) == 0 {
 					return "没有已编译的文章", nil
 				}
 				globalState.Outputs = compiler.consistencyReview(globalState.Task, globalState.Outputs)
 				return fmt.Sprintf("已审查 %d 篇文章", len(globalState.Outputs)), nil
-			}),
-
-		ToolInfoToCallable("generate_index", usage("生成 INDEX.md 索引文件。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "generate_index",
+			Description: usage("生成 INDEX.md 索引文件。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				index := generateDomainIndex(nil, globalState.Outputs)
 				globalState.Outputs = append(globalState.Outputs, index)
 				return fmt.Sprintf("已生成 INDEX.md (%d chars)", len(index.Content)), nil
-			}),
-
-		ToolInfoToCallable("generate_log", usage("生成 log.md 编译日志。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "generate_log",
+			Description: usage("生成 log.md 编译日志。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				log := compiler.generateLog(globalState.Task, globalState.Topics, len(globalState.Files), "synthesis")
 				globalState.Outputs = append(globalState.Outputs, log)
 				return "已生成 log.md", nil
-			}),
-
-		ToolInfoToCallable("quality_review", usage("质量审查：统计链接、孤立文章、覆盖度。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "quality_review",
+			Description: usage("质量审查：统计链接、孤立文章、覆盖度。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				globalState.Outputs = compiler.qualityReview(globalState.Task, globalState.Topics, globalState.Outputs)
 				return fmt.Sprintf("已审查 %d 篇文章", len(globalState.Outputs)), nil
-			}),
-
-		ToolInfoToCallable("write_output", usage("保存编译结果。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "write_output",
+			Description: usage("保存编译结果。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				return fmt.Sprintf("输出 %d 个文件:\n%s", len(globalState.Outputs), outputPaths(globalState.Outputs)), nil
-			}),
-
-		ToolInfoToCallable("search_files", usage("在已加载文件中搜索关键词。需要 query。"),
-			func(ctx context.Context, argsJSON string) (string, error) {
+			},
+		},
+		{
+			Name: "search_files",
+			Description: usage("在已加载文件中搜索关键词。需要 query。"),
+			Run: func(ctx context.Context, argsJSON string) (string, error) {
 				var args struct {
 					Query string `json:"query"`
 				}
@@ -327,7 +379,8 @@ func createAgentTools(compiler *Compiler) []tool.InvokableTool {
 					return "未找到匹配", nil
 				}
 				return fmt.Sprintf("找到 %d 个:\n%s", len(matches), strings.Join(matches, "\n")), nil
-			}),
+			},
+		},
 	}
 }
 
@@ -371,7 +424,7 @@ func (c *Compiler) StartAgentCompile(ctx context.Context, input *CompileInput) (
 			skillContent += fmt.Sprintf("### Skill: %s\n\n%s\n\n", s.Name, s.Content)
 		}
 
-			cp := NewCheckpointManager(c.rdb, taskID)
+		cp := NewCheckpointManager(c.rdb, taskID)
 
 		cfg := &AgentConfig{
 			LLM:          c.llm,
@@ -419,12 +472,12 @@ func outputPaths(outputs []OutputFile) string {
 
 // compressContext trims message history to prevent unbounded prompt growth.
 // Keeps the system message + the most recent N message pairs.
-func compressContext(msgs []*schema.Message, maxLen int) []*schema.Message {
+func compressContext(msgs []openai.ChatCompletionMessage, maxLen int) []openai.ChatCompletionMessage {
 	if len(msgs) <= maxLen {
 		return msgs
 	}
 	// Always keep system message (index 0)
-	compressed := []*schema.Message{msgs[0]}
+	compressed := []openai.ChatCompletionMessage{msgs[0]}
 	// Keep recent messages
 	start := len(msgs) - (maxLen - 1)
 	if start < 1 {
