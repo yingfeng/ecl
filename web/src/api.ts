@@ -1,4 +1,4 @@
-import type { TreeNode, FileCommit, Dataset, DocsFile, CompileTask } from './types'
+import type { TreeNode, FileCommit, Dataset, DocsFile, CompileTask, GbrainCycle, GbrainCycleSummary } from './types'
 
 const BASE = '/api/v1'
 
@@ -119,4 +119,29 @@ export async function listCompileTasks(): Promise<CompileTask[]> {
 
 export function compileLogURL(taskID: string): string {
   return `${BASE}/agent/compile/${taskID}/logs`
+}
+
+// ===== Gbrain Cycle APIs =====
+
+export async function startGbrainCycle(opts: {
+  workspace_id: string
+  instructions?: string
+  skill_refs?: string[]
+  output_dir?: string
+  commit_message?: string
+}): Promise<{ cycle_id: string; status: string }> {
+  return api<{ cycle_id: string; status: string }>('/agent/gbrain/cycle', {
+    method: 'POST',
+    body: JSON.stringify(opts),
+  })
+}
+
+export async function getGbrainCycle(id: string): Promise<GbrainCycle> {
+  const r = await api<{ data: GbrainCycle }>(`/agent/gbrain/cycle/${id}`)
+  return r.data ?? r
+}
+
+export async function listGbrainCycles(): Promise<GbrainCycleSummary[]> {
+  const r = await api<{ data: GbrainCycleSummary[] }>('/agent/gbrain/cycle/list')
+  return Array.isArray(r) ? r : (r as any).data || []
 }

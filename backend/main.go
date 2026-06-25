@@ -7,6 +7,7 @@ import (
 	"llmwiki/backend/agent"
 	"llmwiki/backend/config"
 	"llmwiki/backend/dao"
+	"llmwiki/backend/gbrain"
 	"llmwiki/backend/handler"
 	"llmwiki/backend/router"
 	"llmwiki/backend/service"
@@ -54,13 +55,18 @@ func main() {
 	compiler := agent.NewCompiler(fileSvc, llmClient, rdb)
 	log.Printf("Agent compiler initialized (model=%s, base=%s)", cfg.LLMModel, cfg.LLMBaseURL)
 
-	// 5. Initialize handlers
+	// 6. Initialize Gbrain Compiler
+	gbrainCompiler := gbrain.NewGbrainCompiler(compiler, fileSvc, llmClient, rdb)
+	log.Println("Gbrain cycle compiler initialized")
+
+	// 7. Initialize handlers
 	h := &router.Handlers{
 		File:    handler.NewFileHandler(fileSvc),
 		Dataset: handler.NewDatasetHandler(datasetSvc),
 		Doc:     handler.NewDocumentHandler(docSvc),
 		Commit:  handler.NewCommitHandler(fileSvc),
 		Compile: handler.NewCompileHandler(compiler),
+		Gbrain:  handler.NewGbrainHandler(gbrainCompiler),
 	}
 
 	// 5. Setup Gin router

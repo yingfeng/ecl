@@ -12,6 +12,7 @@ type Handlers struct {
 	Doc     *handler.DocumentHandler
 	Commit  *handler.CommitHandler
 	Compile *handler.CompileHandler
+	Gbrain  *handler.GbrainHandler
 }
 
 func Setup(r *gin.Engine, h *Handlers) {
@@ -79,6 +80,18 @@ func Setup(r *gin.Engine, h *Handlers) {
 		compile.GET("/:id", h.Compile.GetTask)            // Get task status + logs
 		compile.GET("/:id/logs", h.Compile.StreamLogs)    // SSE log streaming
 	}
+
+	// ===== Gbrain Cycle API =====
+	gbrain := api.Group("/agent/gbrain/cycle")
+	{
+		gbrain.POST("", h.Gbrain.StartCycle)              // Start gbrain cycle (?force=1 bypasses cooldown)
+		gbrain.GET("/list", h.Gbrain.ListCycles)          // List all cycles
+		gbrain.GET("/:id", h.Gbrain.GetCycle)             // Get cycle status
+		gbrain.DELETE("/cooldown", h.Gbrain.ClearCooldown) // Clear cooldown (?workspace_id=xxx)
+	}
+
+	// ===== Gbrain Report API (skip compile, generate report only) =====
+	api.POST("/agent/gbrain/report", h.Gbrain.GenerateReport)
 }
 
 

@@ -86,3 +86,32 @@ export interface CompileTask {
   error?: string
   log_preview?: string
 }
+
+// ===== Gbrain Cycle Types =====
+
+export interface GbrainCycle {
+  id: string
+  status: 'pending' | 'running' | 'success' | 'failed' | 'skipped'
+  log?: string
+  agent_task_id?: string
+  new_articles: number
+  updated_articles: number
+  facts_extracted: number
+  takes_extracted: number
+  patterns_found: number
+  takes_consolidated: number
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  error?: string
+}
+
+export interface GbrainCycleSummary {
+  id: string
+  status: string
+  new_articles: number
+  facts_extracted: number
+  patterns_found: number
+  created_at: string
+  finished_at?: string
+}
