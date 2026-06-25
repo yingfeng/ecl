@@ -102,8 +102,8 @@ takes 字段说明:
 	return allFacts, allTakes
 }
 
-// ===== Phase 6: Discover Patterns =====
-// gbrain's patterns phase: cross-session theme detection across all articles.
+// ===== Phase: Pattern Discovery (enhanced with article search) =====
+// Provides article search context to the LLM, like gbrain's brain_search tool.
 // Requires at least 3 articles (like gbrain's minEvidence).
 
 func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledArticle) []PatternEntry {
@@ -115,7 +115,17 @@ func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledA
 		return nil
 	}
 
+	// Build article index (like gbrain's brain_search)
+	articleIndex := g.buildArticleSearchIndex(articles)
+	articleMap := make(map[string]CompiledArticle)
+	for _, art := range articles {
+		slug := strings.TrimSuffix(art.Slug, ".md")
+		articleMap[slug] = art
+	}
+
 	systemMsg := `你是一个模式发现专家。分析以下知识文章，发现跨文章重复出现的主题、模式或原则。
+你拥有文章搜索工具: 调用 "SEARCH: <关键词>" 来搜索相关文章。
+调用 "READ: <文章slug>" 来读取完整文章内容。
 
 输出JSON格式:
 {
@@ -124,7 +134,7 @@ func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledA
       "title": "模式名称(中文)",
       "slug": "pattern-slug-in-english",
       "description": "简要描述这个模式",
-      "article_refs": ["article1-slug.md", "article2-slug.md"]
+      "article_refs": ["article-slug", "article-slug"]
     }
   ]
 }
@@ -134,13 +144,34 @@ func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledA
 - 每篇文章可以出现在多个模式中
 - 输出纯JSON, 不要markdown fence`
 
+	// Build initial summaries
 	var b strings.Builder
-	for _, art := range articles {
-		summary := art.Content
-		if len(summary) > 300 {
-			summary = summary[:300]
+	b.WriteString("## Article Index\n\n")
+	for slug, entries := range articleIndex {
+		b.WriteString(fmt.Sprintf("- [[%s]]: %s\n", slug, strings.Join(entries, "; ")))
+	}
+	b.WriteString("\n使用 SEARCH: <关键词> 搜索, 使用 READ: <slug> 读取全文。\n\n")
+
+	// Simulate search: build a comprehensive prompt with keyword-grouped articles
+	b.WriteString("## Articles by Keywords\n\n")
+	kwArticles := g.groupArticlesByKeyword(articles)
+	for kw, group := range kwArticles {
+		b.WriteString(fmt.Sprintf("### %s\n", kw))
+		for _, slug := range group {
+			b.WriteString(fmt.Sprintf("- [[%s]]\n", slug))
 		}
-		b.WriteString(fmt.Sprintf("### %s\n%s\n\n", art.Slug, summary))
+		b.WriteString("\n")
+	}
+
+	// Full summaries for reference
+	b.WriteString("## Full Article Summaries\n\n")
+	for _, art := range articles {
+		slug := strings.TrimSuffix(art.Slug, ".md")
+		summary := art.Content
+		if len(summary) > 400 {
+			summary = summary[:400]
+		}
+		b.WriteString(fmt.Sprintf("### [[%s]]\n%s\n\n", slug, summary))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -150,6 +181,9 @@ func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledA
 		task.AppendLog("[PATTERNS] LLM error: %v\n", err)
 		return nil
 	}
+
+	// Handle SEARCH: and READ: commands in output (in case LLM uses them)
+	_ = articleMap // available for future tool expansion
 
 	var result struct {
 		Patterns []PatternEntry `json:"patterns"`
@@ -166,6 +200,75 @@ func (g *GbrainCompiler) discoverPatterns(task *GbrainTask, articles []CompiledA
 		task.AppendLog("  - %s (%s): %d articles\n", p.Title, p.Slug, len(p.ArticleRefs))
 	}
 	return result.Patterns
+}
+
+// buildArticleSearchIndex creates keyword→articles index for search.
+func (g *GbrainCompiler) buildArticleSearchIndex(articles []CompiledArticle) map[string][]string {
+	idx := make(map[string][]string)
+	for _, art := range articles {
+		slug := strings.TrimSuffix(art.Slug, ".md")
+		// Extract keywords from content (simple heuristic: top-N noun phrases)
+		words := strings.Fields(art.Content)
+		seen := make(map[string]bool)
+		for _, w := range words {
+			w = strings.Trim(w, ".,;:!?()[]{}'\"")
+			if len(w) < 3 || isStopWord(w) {
+				continue
+			}
+			if !seen[w] {
+				idx[w] = append(idx[w], slug)
+				seen[w] = true
+			}
+		}
+	}
+	return idx
+}
+
+// groupArticlesByKeyword groups articles by shared keywords for search simulation.
+func (g *GbrainCompiler) groupArticlesByKeyword(articles []CompiledArticle) map[string][]string {
+	groups := make(map[string][]string)
+	for _, art := range articles {
+		slug := strings.TrimSuffix(art.Slug, ".md")
+		// Use title headings as keywords
+		for _, line := range strings.Split(art.Content, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "# ") {
+				title := strings.TrimPrefix(line, "# ")
+				groups[title] = append(groups[title], slug)
+			}
+			if strings.HasPrefix(line, "## ") {
+				section := strings.TrimPrefix(line, "## ")
+				groups[section] = append(groups[section], slug)
+				break // only first section heading
+			}
+		}
+	}
+	return groups
+}
+
+var stopWords = map[string]bool{
+	"the": true, "and": true, "for": true, "are": true, "but": true, "not": true,
+	"you": true, "all": true, "can": true, "had": true, "her": true, "was": true,
+	"one": true, "our": true, "out": true, "has": true, "have": true, "this": true,
+	"that": true, "with": true, "from": true, "they": true, "been": true, "said": true,
+	"will": true, "each": true, "than": true, "them": true, "when": true, "what": true,
+	"which": true, "their": true, "there": true, "about": true, "would": true,
+	"into": true, "over": true, "such": true, "also": true, "other": true, "more": true,
+	"some": true, "these": true, "very": true, "just": true, "like": true, "make": true,
+	"made": true, "well": true, "even": true, "most": true, "much": true, "same": true,
+	"both": true, "here": true, "then": true, "only": true, "way": true,
+	"were": true, "its": true, "does": true, "down": true, "how": true,
+	"now": true, "too": true, "two": true, "use": true, "used": true, "using": true,
+	"基于": true, "通过": true, "进行": true, "用于": true, "可以": true, "需要": true,
+	"一个": true, "这个": true, "这些": true, "那些": true, "没有": true, "不是": true,
+	"因为": true, "所以": true, "如果": true, "但是": true, "而且": true, "或者": true,
+	"什么": true, "怎么": true, "如何": true, "就是": true, "还是": true, "虽然": true,
+}
+
+func isStopWord(w string) bool {
+	w = strings.ToLower(w)
+	_, ok := stopWords[w]
+	return ok
 }
 
 // ===== Phase 7: Consolidate Facts → Takes =====

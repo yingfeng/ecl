@@ -176,17 +176,38 @@ func (g *GbrainCompiler) runCycle(task *GbrainTask, input *agent.CompileInput) {
 	consolidatedTakes := g.consolidateFacts(task, facts, takes)
 	takes = append(takes, consolidatedTakes...)
 
-	// ── Phase 9: Write enhanced output ──
-	task.AppendLog("[GBRAIN] ---- Phase 9: Writing Enhanced Output ----\n")
-	g.writeEnhancedOutput(task, input, articles, facts, takes, patterns)
+	// ── Phase 9: Link graph (P1: wikilink extraction) ──
+	task.AppendLog("[GBRAIN] ---- Phase 9: Link Graph ----\n")
+	linkGraph := extractLinkGraph(articles)
+
+	// ── Phase 10: Timeline extraction (P2) ──
+	task.AppendLog("[GBRAIN] ---- Phase 10: Timeline ----\n")
+	timeline := extractTimeline(articles)
+
+	// ── Phase 11: Concept synthesis (P2) ──
+	task.AppendLog("[GBRAIN] ---- Phase 11: Concept Synthesis ----\n")
+	concepts := g.synthesizeConcepts(task, articles)
+
+	// ── Phase 12: Calibration pipeline (P2) ──
+	task.AppendLog("[GBRAIN] ---- Phase 12: Calibration ----\n")
+	var profile *CalibrationProfile
+	if len(articles) >= 3 {
+		proposals := g.proposeTakes(task, articles)
+		grades := g.gradeTakes(task, articles, proposals)
+		profile = g.generateProfile(task, proposals, grades)
+	}
+
+	// ── Phase 13: Write enhanced output ──
+	task.AppendLog("[GBRAIN] ---- Phase 13: Writing Enhanced Output ----\n")
+	g.writeEnhancedOutput(task, input, articles, facts, takes, patterns, linkGraph, timeline, concepts, profile)
 
 	// ── Complete ──
 	task.SetStatus(CycleSuccess)
 	task.FinishedAt = time.Now()
 	g.setCooldown(input.WorkspaceID)
 	task.AppendLog("[GBRAIN] ===== Gbrain Cycle Complete =====\n")
-	task.AppendLog("Articles: %d new + %d updated | Facts: %d | Takes: %d | Patterns: %d | Consolidated: %d\n",
-		task.NewArticles, task.UpdatedArticles, task.FactsExtracted, task.TakesExtracted, task.PatternsFound, task.TakesConsolidated)
+	task.AppendLog("Articles: %d | Facts: %d | Takes: %d | Patterns: %d | Links: %d | Timeline: %d | Concepts: %d\n",
+		len(articles), len(facts), len(takes), len(patterns), len(linkGraph.Links), len(timeline), len(concepts))
 }
 
 // runReportOnly skips agent compile, reads existing output, runs gbrain phases 6-9.
@@ -228,14 +249,31 @@ func (g *GbrainCompiler) runReportOnly(task *GbrainTask, input *agent.CompileInp
 	consolidatedTakes := g.consolidateFacts(task, facts, takes)
 	takes = append(takes, consolidatedTakes...)
 
-	task.AppendLog("[GBRAIN] ---- Phase 9: Writing Report ----\n")
-	g.writeEnhancedOutput(task, input, articles, facts, takes, patterns)
+	task.AppendLog("[GBRAIN] ---- Phase 9: Link Graph ----\n")
+	linkGraph := extractLinkGraph(articles)
+
+	task.AppendLog("[GBRAIN] ---- Phase 10: Timeline ----\n")
+	timeline := extractTimeline(articles)
+
+	task.AppendLog("[GBRAIN] ---- Phase 11: Concept Synthesis ----\n")
+	concepts := g.synthesizeConcepts(task, articles)
+
+	task.AppendLog("[GBRAIN] ---- Phase 12: Calibration ----\n")
+	var profile *CalibrationProfile
+	if len(articles) >= 3 {
+		proposals := g.proposeTakes(task, articles)
+		grades := g.gradeTakes(task, articles, proposals)
+		profile = g.generateProfile(task, proposals, grades)
+	}
+
+	task.AppendLog("[GBRAIN] ---- Phase 13: Writing Report ----\n")
+	g.writeEnhancedOutput(task, input, articles, facts, takes, patterns, linkGraph, timeline, concepts, profile)
 
 	task.SetStatus(CycleSuccess)
 	task.FinishedAt = time.Now()
 	task.AppendLog("[GBRAIN] ===== Report Complete =====\n")
-	task.AppendLog("Articles: %d | Facts: %d | Takes: %d | Patterns: %d | Consolidated: %d\n",
-		len(articles), len(facts), len(takes), len(patterns), len(consolidatedTakes))
+	task.AppendLog("Articles: %d | Facts: %d | Takes: %d | Patterns: %d | Links: %d | Timeline: %d | Concepts: %d\n",
+		len(articles), len(facts), len(takes), len(patterns), len(linkGraph.Links), len(timeline), len(concepts))
 }
 
 // readOutputArticles reads compiled articles only from the agent's output directory.
@@ -332,154 +370,272 @@ func (g *GbrainCompiler) readOutputArticles(input *agent.CompileInput) ([]Compil
 	return articles, nil
 }
 
-// writeEnhancedOutput creates a single gbrain-report.md with all structured knowledge.
-// Does NOT modify the original agent output files.
-func (g *GbrainCompiler) writeEnhancedOutput(task *GbrainTask, input *agent.CompileInput, articles []CompiledArticle, facts []FactEntry, takes []TakeEntry, patterns []PatternEntry) {
+// writeEnhancedOutput writes gbrain phase outputs to per-subfolder files.
+// Patterns/concepts/calibration → standalone pages (user-readable).
+// Facts/takes → fence-embedded (intermediate data, not standalone).
+func (g *GbrainCompiler) writeEnhancedOutput(task *GbrainTask, input *agent.CompileInput, articles []CompiledArticle, facts []FactEntry, takes []TakeEntry, patterns []PatternEntry, linkGraph LinkGraph, timeline []TimelineEntry, concepts []ConceptEntry, profile *CalibrationProfile) {
 	outputDir := input.OutputDir
 	if outputDir == "" {
 		outputDir = "synthesis"
 	}
 
-	// Find the output folder — agent names it "{workspaceName}-{outputDir}"
+	// Find the output folder
 	root, _ := g.fileSvc.GetOrCreateRootFolder(input.TenantID, input.Actor)
-	srcWorkspace, err := g.fileSvc.GetFileByID(input.WorkspaceID)
+	srcWorkspace, _ := g.fileSvc.GetFileByID(input.WorkspaceID)
 	targetName := outputDir
-	if err == nil && srcWorkspace != nil {
+	if srcWorkspace != nil {
 		targetName = srcWorkspace.Name + "-" + outputDir
 	}
-	outputFolderID := root.ID
-	tree, _ := g.fileSvc.GetCurrentTree(root.ID)
-	if tree != nil {
-		var search func(nodes []entity.TreeNode) string
-		search = func(nodes []entity.TreeNode) string {
-			for _, c := range nodes {
-				if c.Type == "folder" && c.Name == targetName {
-					return c.ID
-				}
-				if len(c.Children) > 0 {
-					if id := search(c.Children); id != "" {
-						return id
-					}
-				}
-			}
-			return ""
-		}
-		if id := search(tree.Children); id != "" {
-			outputFolderID = id
+	outputFolderID := g.findFolderByName(root.ID, targetName)
+	if outputFolderID == "" {
+		outputFolderID = root.ID
+	}
+
+	// Create gbrain subfolder for supplementary knowledge
+	gbrainFolderID := g.findOrCreateFolder(input, outputFolderID, "gbrain")
+
+	var totalWritten int
+
+	// ── Overview (lightweight index, NOT a data dump) ──
+	overview := renderGbrainOverview(articles, facts, takes, patterns, linkGraph, timeline, concepts)
+	if _, err := g.fileSvc.CreateTextFile(input.TenantID, gbrainFolderID, "overview.md", overview, input.Actor); err == nil {
+		totalWritten++
+	}
+
+	// ── Knowledge Graph (Link Graph + Timeline) ──
+	if len(linkGraph.Links) > 0 || len(timeline) > 0 {
+		kg := renderKnowledgeGraph(linkGraph, timeline)
+		if _, err := g.fileSvc.CreateTextFile(input.TenantID, gbrainFolderID, "knowledge-graph.md", kg, input.Actor); err == nil {
+			totalWritten++
 		}
 	}
 
-	// Build the report
-	report := renderGbrainReport(articles, facts, takes, patterns)
-	var writeErr error
-	_, writeErr = g.fileSvc.CreateTextFile(input.TenantID, outputFolderID, "gbrain-report.md", report, input.Actor)
-	if writeErr != nil {
-		task.AppendLog("[WRITE] Failed to write gbrain-report.md: %v\n", writeErr)
-		return
+	// ── Patterns: one file per pattern in gbrain/patterns/ ──
+	if len(patterns) > 0 {
+		patternsFolderID := g.findOrCreateFolder(input, gbrainFolderID, "patterns")
+		// Index
+		patternsIndex := renderPatternsIndex(patterns)
+		if _, err := g.fileSvc.CreateTextFile(input.TenantID, patternsFolderID, "index.md", patternsIndex, input.Actor); err == nil {
+			totalWritten++
+		}
+		// Per-pattern pages
+		for _, p := range patterns {
+			page := renderPatternPage(p)
+			if _, err := g.fileSvc.CreateTextFile(input.TenantID, patternsFolderID, p.Slug+".md", page, input.Actor); err == nil {
+				totalWritten++
+			}
+		}
 	}
-	task.NewArticles = 1
-	task.AppendLog("[WRITE] Created gbrain-report.md (%d facts, %d takes, %d patterns)\n", len(facts), len(takes), len(patterns))
+
+	// ── Concepts: one file per tier group in gbrain/concepts/ ──
+	if len(concepts) > 0 {
+		conceptsFolderID := g.findOrCreateFolder(input, gbrainFolderID, "concepts")
+		conceptsIndex := renderConceptsIndex(concepts)
+		if _, err := g.fileSvc.CreateTextFile(input.TenantID, conceptsFolderID, "index.md", conceptsIndex, input.Actor); err == nil {
+			totalWritten++
+		}
+		for _, c := range concepts {
+			page := renderConceptPage(c)
+			if _, err := g.fileSvc.CreateTextFile(input.TenantID, conceptsFolderID, c.Slug+".md", page, input.Actor); err == nil {
+				totalWritten++
+			}
+		}
+	}
+
+	// ── Calibration Profile ──
+	if profile != nil {
+		prof := renderCalibrationPage(profile)
+		if _, err := g.fileSvc.CreateTextFile(input.TenantID, gbrainFolderID, "calibration-profile.md", prof, input.Actor); err == nil {
+			totalWritten++
+		}
+	}
+
+	task.NewArticles = totalWritten
+	task.AppendLog("[WRITE] Wrote %d gbrain files (%d patterns, %d concepts, links+timeline, profile)\n",
+		totalWritten, len(patterns), len(concepts))
 }
 
-func renderGbrainReport(articles []CompiledArticle, facts []FactEntry, takes []TakeEntry, patterns []PatternEntry) string {
+// ===== Helper: find folder by name anywhere in tree (recursive) =====
+
+func (g *GbrainCompiler) findFolderByName(rootID, name string) string {
+	tree, err := g.fileSvc.GetCurrentTree(rootID)
+	if err != nil {
+		return ""
+	}
+	var search func(nodes []entity.TreeNode) string
+	search = func(nodes []entity.TreeNode) string {
+		for _, c := range nodes {
+			if c.Type == "folder" && c.Name == name {
+				return c.ID
+			}
+			if len(c.Children) > 0 {
+				if id := search(c.Children); id != "" {
+					return id
+				}
+			}
+		}
+		return ""
+	}
+	return search(tree.Children)
+}
+
+// ===== Helper: find or create subfolder =====
+
+func (g *GbrainCompiler) findOrCreateFolder(input *agent.CompileInput, parentID, name string) string {
+	// Try to find existing
+	if id := g.findFolderByName(parentID, name); id != "" {
+		return id
+	}
+	// Create new
+	f, err := g.fileSvc.CreateFolder(input.TenantID, parentID, name, input.Actor)
+	if err != nil {
+		return parentID // fallback to parent
+	}
+	return f.ID
+}
+
+// ===== Per-file renderers =====
+
+// renderGbrainOverview: lightweight index, NOT data dump.
+// Users and agents read this to navigate gbrain outputs.
+func renderGbrainOverview(articles []CompiledArticle, facts []FactEntry, takes []TakeEntry, patterns []PatternEntry, linkGraph LinkGraph, timeline []TimelineEntry, concepts []ConceptEntry) string {
 	var b strings.Builder
-	b.WriteString("# Gbrain Compilation Report\n\n")
-	b.WriteString("> 此报告由 gbrain 循环编译器自动生成，包含结构化知识提取和跨 session 模式发现结果。\n\n")
-	b.WriteString("## Overview\n\n")
-	b.WriteString(fmt.Sprintf("- **Articles analyzed**: %d\n", len(articles)))
-	b.WriteString(fmt.Sprintf("- **Facts extracted**: %d\n", len(facts)))
-	b.WriteString(fmt.Sprintf("- **Takes extracted**: %d\n", len(takes)))
-	b.WriteString(fmt.Sprintf("- **Patterns discovered**: %d\n", len(patterns)))
-	b.WriteString("\n---\n\n")
+	b.WriteString("# Gbrain Knowledge Overview\n\n")
+	b.WriteString("> 此概览由 gbrain 循环编译器生成。详细内容见各子目录。\n\n")
 
-	// Per-article knowledge summary
-	b.WriteString("## Per-Article Knowledge\n\n")
-	for _, art := range articles {
-		b.WriteString(fmt.Sprintf("### [[%s]]\n\n", strings.TrimSuffix(art.Slug, ".md")))
-		// Find facts/takes for this article
-		var artFacts []FactEntry
-		var artTakes []TakeEntry
-		for _, f := range facts {
-			if strings.Contains(art.Slug, f.Source) || strings.Contains(f.Source, art.Slug) {
-				artFacts = append(artFacts, f)
-			}
-		}
-		for _, t := range takes {
-			if t.Holder != "consolidated" && (strings.Contains(art.Slug, t.Source) || strings.Contains(t.Source, art.Slug)) {
-				artTakes = append(artTakes, t)
-			}
-		}
-		if len(artFacts) > 0 {
-			b.WriteString("**Facts**:\n")
-			for _, f := range artFacts {
-				b.WriteString(fmt.Sprintf("- %s [confidence: %.2f, kind: %s]\n", f.Claim, f.Confidence, f.Kind))
-			}
-			b.WriteString("\n")
-		}
-		if len(artTakes) > 0 {
-			b.WriteString("**Takes**:\n")
-			for _, t2 := range artTakes {
-				b.WriteString(fmt.Sprintf("- %s [weight: %.2f, kind: %s]\n", t2.Claim, t2.Weight, t2.Kind))
-			}
-			b.WriteString("\n")
-		}
-	}
+	b.WriteString("## Compilation Stats\n\n")
+	b.WriteString(fmt.Sprintf("| Metric | Count |\n|---|---|\n"))
+	b.WriteString(fmt.Sprintf("| Source articles | %d |\n", len(articles)))
+	b.WriteString(fmt.Sprintf("| Facts extracted | %d |\n", len(facts)))
+	b.WriteString(fmt.Sprintf("| Takes extracted | %d |\n", len(takes)))
+	b.WriteString(fmt.Sprintf("| Patterns discovered | %d |\n", len(patterns)))
+	b.WriteString(fmt.Sprintf("| Links extracted | %d |\n", len(linkGraph.Links)))
+	b.WriteString(fmt.Sprintf("| Timeline entries | %d |\n", len(timeline)))
+	b.WriteString(fmt.Sprintf("| Concepts synthesized | %d |\n", len(concepts)))
 
-	// Full knowledge snapshot (fence)
-	b.WriteString("---\n\n## Full Knowledge Snapshot\n\n")
-
-	// Deduplicate facts/takes for the global snapshot
-	seenFacts := make(map[string]bool)
-	var uniqueFacts []FactEntry
-	for _, f := range facts {
-		key := f.Claim
-		if !seenFacts[key] {
-			seenFacts[key] = true
-			uniqueFacts = append(uniqueFacts, f)
-		}
-	}
-	seenTakes := make(map[string]bool)
-	var uniqueTakes []TakeEntry
-	for _, t := range takes {
-		key := t.Claim
-		if !seenTakes[key] {
-			seenTakes[key] = true
-			uniqueTakes = append(uniqueTakes, t)
-		}
-	}
-
-	b.WriteString(RenderFactsFence(uniqueFacts))
-	b.WriteString("\n")
-	b.WriteString(RenderTakesFence(uniqueTakes))
-
-	// Patterns
+	b.WriteString("\n## Navigation\n\n")
+	b.WriteString("- **[[knowledge-graph]]** → Article link graph and timeline\n")
 	if len(patterns) > 0 {
-		b.WriteString("---\n\n## Patterns (Cross-Article Themes)\n\n")
-		for _, p := range patterns {
-			b.WriteString(fmt.Sprintf("### %s\n\n", p.Title))
-			b.WriteString(p.Description + "\n\n")
-			b.WriteString("**Related articles**:\n")
-			for _, ref := range p.ArticleRefs {
-				b.WriteString(fmt.Sprintf("- [[%s]]\n", strings.TrimSuffix(ref, ".md")))
-			}
-			b.WriteString("\n")
-		}
+		b.WriteString("- **[[patterns/index]]** → Cross-article patterns\n")
 	}
+	if len(concepts) > 0 {
+		b.WriteString("- **[[concepts/index]]** → Synthesized concepts\n")
+	}
+	b.WriteString("- **[[calibration-profile]]** → Calibration profile\n")
 
-	// Consolidated takes
-	var consolidated []TakeEntry
-	for _, t := range takes {
-		if t.Holder == "consolidated" || t.Kind == "consolidated" {
-			consolidated = append(consolidated, t)
-		}
+	b.WriteString("\n---\n\n## Primary Articles\n\n")
+	b.WriteString("以下为主要知识文章（由 agent 编译生成）：\n\n")
+	for _, art := range articles {
+		slug := strings.TrimSuffix(art.Slug, ".md")
+		b.WriteString(fmt.Sprintf("- [[%s]]\n", slug))
 	}
-	if len(consolidated) > 0 {
-		b.WriteString("---\n\n## Consolidated Takes (Facts → Takes)\n\n")
-		for _, t := range consolidated {
-			b.WriteString(fmt.Sprintf("- %s [weight: %.2f]\n  _Source: %s_\n\n", t.Claim, t.Weight, t.Source))
-		}
-	}
+	return b.String()
+}
 
+// renderKnowledgeGraph: link graph + timeline (intermediate data)
+func renderKnowledgeGraph(linkGraph LinkGraph, timeline []TimelineEntry) string {
+	var b strings.Builder
+	b.WriteString("# Knowledge Graph\n\n")
+	b.WriteString("> 文章之间的链接关系和时序信息。由 gbrain 自动提取。\n\n")
+
+	if len(linkGraph.Links) > 0 {
+		b.WriteString(renderLinkSection(linkGraph))
+	}
+	if len(timeline) > 0 {
+		b.WriteString(renderTimelineSection(timeline))
+	}
+	return b.String()
+}
+
+// renderPatternsIndex: list of all patterns
+func renderPatternsIndex(patterns []PatternEntry) string {
+	var b strings.Builder
+	b.WriteString("# Patterns Index\n\n")
+	b.WriteString("> 跨文章重复出现的主题和模式。每个模式是一个独立的知识页面。\n\n")
+	b.WriteString("| Pattern | Articles | Description |\n")
+	b.WriteString("|---------|----------|-------------|\n")
+	for _, p := range patterns {
+		b.WriteString(fmt.Sprintf("| [[%s]] | %d | %s |\n", p.Slug, len(p.ArticleRefs), p.Description))
+	}
+	return b.String()
+}
+
+// renderPatternPage: standalone pattern page (user-readable)
+func renderPatternPage(p PatternEntry) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("# %s\n\n", p.Title))
+	b.WriteString(fmt.Sprintf("> %s\n\n", p.Description))
+	b.WriteString("## Related Articles\n\n")
+	for _, ref := range p.ArticleRefs {
+		b.WriteString(fmt.Sprintf("- [[%s]]\n", strings.TrimSuffix(ref, ".md")))
+	}
+	b.WriteString("\n---\n")
+	b.WriteString(fmt.Sprintf("_Discovered by gbrain pattern detection_\n"))
+	return b.String()
+}
+
+// renderConceptsIndex: list of all concepts
+func renderConceptsIndex(concepts []ConceptEntry) string {
+	var b strings.Builder
+	b.WriteString("# Concepts Index\n\n")
+	b.WriteString("> 跨文章综合而成的知识概念。按文章数量分 T1/T2/T3/T4 四个层级。\n\n")
+	b.WriteString("| Tier | Concept | Articles | Description |\n")
+	b.WriteString("|------|---------|----------|-------------|\n")
+	for _, c := range concepts {
+		b.WriteString(fmt.Sprintf("| %s | [[%s]] | %d | %s |\n", c.Tier, c.Slug, len(c.ArticleRefs), c.Description))
+	}
+	return b.String()
+}
+
+// renderConceptPage: standalone concept page (user-readable)
+func renderConceptPage(c ConceptEntry) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("# %s\n\n", c.Name))
+	b.WriteString(fmt.Sprintf("**Tier**: %s  \n", c.Tier))
+	b.WriteString(fmt.Sprintf("**Description**: %s\n\n", c.Description))
+	if c.Narrative != "" {
+		b.WriteString("## Executive Summary\n\n")
+		b.WriteString(c.Narrative + "\n\n")
+	}
+	b.WriteString("## Related Articles\n\n")
+	for _, ref := range c.ArticleRefs {
+		b.WriteString(fmt.Sprintf("- [[%s]]\n", strings.TrimSuffix(ref, ".md")))
+	}
+	b.WriteString(fmt.Sprintf("\n_Synthesized from %d articles by gbrain concept synthesis_\n", len(c.ArticleRefs)))
+	return b.String()
+}
+
+// renderCalibrationPage: standalone calibration profile page
+func renderCalibrationPage(profile *CalibrationProfile) string {
+	return fmt.Sprintf(`# Calibration Profile
+
+> 此画像由 gbrain 校准管道生成，基于知识主张的自动裁决结果。
+
+## Narrative Patterns
+
+%s
+
+## Bias Tags
+
+%s
+
+---
+
+_Generated by gbrain calibration pipeline (propose → grade → aggregate)_
+`,
+		formatBullets(profile.NarrativeStatements),
+		formatBullets(profile.BiasTags),
+	)
+}
+
+func formatBullets(items []string) string {
+	if len(items) == 0 {
+		return "_None_\n"
+	}
+	var b strings.Builder
+	for _, item := range items {
+		b.WriteString(fmt.Sprintf("- %s\n", item))
+	}
 	return b.String()
 }
 
